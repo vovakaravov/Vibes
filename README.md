@@ -13,10 +13,10 @@
 ## Highlights
 
 - **Global Radio Directory (RadioBrowser):** Search 50,000+ stations by name or genre, **Spin the Dial** random high-bitrate picker, local country blending, custom stream URLs, `1`–`9` favorite presets, cached station favicons, and automatic reconnect on dropped streams.
-- **Audio-Only YouTube (`mpv` + `yt-dlp`):** Stream music mixes, podcasts, and livestreams without decoding video frames — zero ads, low RAM, `All` / `Music` / `Podcasts (20m+)` / `Live` filters, Up Next queue, variable playback speed (`0.75x–2.0x`), thumbnails, and auto-resume timestamps for long podcasts.
+- **Audio-Only YouTube (`mpv` + `yt-dlp`):** Stream music mixes, podcasts, and livestreams without decoding video frames — zero ads, low RAM (bounded `16 MiB` forward / `8 MiB` back `mpv` demuxer cache and stripped ThinLTO release builds), `All` / `Music` / `Podcasts (20m+)` / `Live` filters, Up Next queue, variable playback speed (`0.75x–2.0x`), thumbnails, and auto-resume timestamps for long podcasts.
 - **Full Albums & Offline Local Library:**
   - Browse and search full YouTube Music albums with tracklists and square cover art, and download complete tagged albums into `~/Music` (`Artist / Album`, `Album - Name`, or `Artist - Album` folder layouts).
-  - Built-in **Local Library** scans `~/Music` and `~/Music/Radio` for offline album & single playback with embedded artwork and metadata backed by a bounded LRU image cache.
+  - Built-in **Local Library** scans `~/Music` and `~/Music/Radio` for offline album & single playback with embedded artwork and metadata backed by a bounded 48-entry LRU image cache.
 - **Smart Save Song (`.opus` / `.m4a` / `.mp3` / `.ogg` / `.flac` + Cover Art + Tags via `lofty`):** Identifies radio tracks, downloads the clean YouTube audio stream (`.opus` by default, configurable format and `Flat` / `By Artist` folder layout in `~/Music/Radio`), crops thumbnails to square JPEG cover art via `ffmpeg`, and embeds full artist/album/date/genre/source tags plus lyrics.
 - **Embedded & Live Synced Lyrics (`lofty` + LRCLIB):**
   - Automatically fetches synced LRC (or plain) lyrics from LRCLIB and embeds them natively during Save Song and Full Album downloads (`USLT` via `ItemKey::UnsyncLyrics` for ID3v2/MP3; `LYRICS` / `©lyr` via `ItemKey::Lyrics` for Opus, Ogg, FLAC, and M4A).
