@@ -65,27 +65,27 @@ impl Palette {
     pub fn vibes_crimson() -> Self {
         Self {
             is_dark: true,
-            bg_deep: 0x120a0d,
-            bg_main: 0x1a1013,
-            bg_sidebar: 0x211519,
-            bg_panel: 0x2c1b21,
-            bg_btn: 0x3c262d,
-            bg_btn_hover: 0x4c313a,
-            bg_btn_active: 0x311f25,
-            border: 0x472e37,
-            border_subtle: 0x301f25,
-            fg: 0xf1e5e8,
-            fg_muted: 0x876e76,
-            fg_subtle: 0xb89fa7,
-            accent: 0xe04f54,
-            accent_hover: 0xec686c,
-            accent_active: 0xc73b40,
-            green: 0x76c289,
-            yellow: 0xe5be78,
-            red: 0xf06565,
-            orange: 0xe28d64,
-            aqua: 0x78b8b6,
-            violet: 0xba8cc9,
+            bg_deep: 0x0f0c0c,
+            bg_main: 0x191616,
+            bg_sidebar: 0x1f1b1b,
+            bg_panel: 0x2a2526,
+            bg_btn: 0x3b3435,
+            bg_btn_hover: 0x483f41,
+            bg_btn_active: 0x322c2d,
+            border: 0x3e3638,
+            border_subtle: 0x2c2627,
+            fg: 0xdcd7ba,
+            fg_muted: 0x78706e,
+            fg_subtle: 0xa39a98,
+            accent: 0xcc585d,
+            accent_hover: 0xda6c71,
+            accent_active: 0xb5484d,
+            green: 0x87a987,
+            yellow: 0xc4b28a,
+            red: 0xd46a6e,
+            orange: 0xc29276,
+            aqua: 0x8ea4a2,
+            violet: 0x957fb8,
         }
     }
 
@@ -504,7 +504,7 @@ ForegroundVisited=137,146,167
         let pal = load_palette(ThemePreset::default());
         assert!(pal.is_dark);
         assert_eq!(ThemePreset::default(), ThemePreset::VibesCrimson);
-        assert_eq!(pal.accent, 0xe04f54);
-        assert_eq!(pal.bg_main, 0x1a1013);
+        assert_eq!(pal.accent, 0xcc585d);
+        assert_eq!(pal.bg_main, 0x191616);
     }
 }
