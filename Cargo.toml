@@ -30,3 +30,7 @@ cosmic-text = "0.19"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -180,7 +180,7 @@ impl VibesWindow {
 
         let fh = cx.focus_handle();
         fh.focus(window, cx);
-        let image_cache = art::LruImageCache::new(96, cx);
+        let image_cache = art::LruImageCache::new(48, cx);
 
         Self {
             core,

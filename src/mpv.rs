@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -177,6 +177,28 @@ pub struct MpvController {
     next_id: AtomicU64,
 }
 
+pub fn build_mpv_args(initial_volume: f64, socket_path: &Path) -> Vec<String> {
+    vec![
+        "--no-config".to_string(),
+        "--no-video".to_string(),
+        "--audio-display=no".to_string(),
+        "--no-osc".to_string(),
+        "--no-osd-bar".to_string(),
+        "--load-scripts=no".to_string(),
+        "--idle=yes".to_string(),
+        "--no-terminal".to_string(),
+        "--force-window=no".to_string(),
+        "--keep-open=no".to_string(),
+        "--ytdl=yes".to_string(),
+        "--ytdl-format=bestaudio[ext=webm]/bestaudio/best".to_string(),
+        "--demuxer-max-bytes=16MiB".to_string(),
+        "--demuxer-max-back-bytes=8MiB".to_string(),
+        "--audio-client-name=Vibes".to_string(),
+        format!("--volume={:.0}", initial_volume.clamp(0.0, 100.0)),
+        format!("--input-ipc-server={}", socket_path.display()),
+    ]
+}
+
 impl MpvController {
     pub fn spawn(
         initial_volume: f64,
@@ -186,19 +208,9 @@ impl MpvController {
         let socket_path = uid_or_tmp.join(format!("vibes-mpv-{}.sock", std::process::id()));
         let _ = fs::remove_file(&socket_path);
 
+        let args = build_mpv_args(initial_volume, &socket_path);
         let child = Command::new("mpv")
-            .args([
-                "--no-video",
-                "--idle=yes",
-                "--no-terminal",
-                "--force-window=no",
-                "--keep-open=no",
-                "--ytdl=yes",
-                "--ytdl-format=bestaudio[ext=webm]/bestaudio/best",
-                "--audio-client-name=Vibes",
-                &format!("--volume={:.0}", initial_volume.clamp(0.0, 100.0)),
-                &format!("--input-ipc-server={}", socket_path.display()),
-            ])
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -407,5 +419,17 @@ mod tests {
                 reason: "stop".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn mpv_args_cap_demuxer_cache_and_preserve_ytdl() {
+        let args = build_mpv_args(72.0, Path::new("/tmp/vibes-test.sock"));
+        assert!(args.iter().any(|a| a == "--demuxer-max-bytes=16MiB"));
+        assert!(args.iter().any(|a| a == "--demuxer-max-back-bytes=8MiB"));
+        assert!(args.iter().any(|a| a == "--audio-display=no"));
+        assert!(args.iter().any(|a| a == "--ytdl=yes"));
+        assert!(args.iter().any(|a| a == "--load-scripts=no"));
+        assert!(args.iter().any(|a| a == "--volume=72"));
+        assert!(args.iter().any(|a| a == "--input-ipc-server=/tmp/vibes-test.sock"));
     }
 }
