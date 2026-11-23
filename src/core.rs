@@ -210,6 +210,8 @@ pub struct VibesCore {
     pub muted: bool,
     pub speed: f64,
     pub queue: Vec<QueueItem>,
+    pub queue_history: Vec<QueueItem>,
+    last_prev_click_at: Option<Instant>,
     reconnect_attempts: u8,
     user_stopped: bool,
     last_resume_save_secs: f64,
@@ -413,6 +415,8 @@ impl VibesCore {
             muted: false,
             speed: 1.0,
             queue: Vec::new(),
+            queue_history: Vec::new(),
+            last_prev_click_at: None,
             reconnect_attempts: 0,
             user_stopped: true,
             last_resume_save_secs: 0.0,
@@ -874,24 +878,65 @@ impl VibesCore {
         cx.notify();
     }
 
+    pub fn play_queue_index(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.queue.len() {
+            return;
+        }
+        if let Some(cur) = target_as_queue_item(&self.current_target) {
+            push_queue_history(&mut self.queue_history, cur);
+        }
+        let item = self.queue.remove(idx);
+        self.play_queue_item(item, cx);
+    }
+
+    pub fn play_youtube_standalone(&mut self, item: YoutubeItem, cx: &mut Context<Self>) {
+        match &self.current_target {
+            Some(PlayTarget::Local(t)) => {
+                push_queue_history(&mut self.queue_history, QueueItem::Local(t.clone()));
+            }
+            Some(PlayTarget::Youtube(cur)) if cur.id != item.id => {
+                push_queue_history(&mut self.queue_history, QueueItem::Youtube(cur.clone()));
+            }
+            _ => {}
+        }
+        self.play_youtube(item, cx);
+    }
+
     pub fn play_next_in_queue(&mut self, cx: &mut Context<Self>) {
-        if !self.queue.is_empty() {
-            let next = self.queue.remove(0);
+        if let Some(next) =
+            step_queue_next(&self.current_target, &mut self.queue_history, &mut self.queue)
+        {
             self.play_queue_item(next, cx);
-        } else {
+        } else if matches!(self.current_target, Some(PlayTarget::Radio(_)) | None) {
             self.cycle_favorite(1, cx);
+        } else {
+            self.show_toast("End of queue", cx);
         }
     }
 
     pub fn play_previous_action(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.current_target,
-            Some(PlayTarget::Youtube(_) | PlayTarget::Local(_))
-        ) && self.position_secs > 3.0
-        {
-            self.seek_absolute(0.0, cx);
-        } else {
-            self.cycle_favorite(-1, cx);
+        let rapid_second_click = self
+            .last_prev_click_at
+            .is_some_and(|t| t.elapsed() <= PREV_DOUBLE_CLICK_WINDOW);
+        match step_queue_previous(
+            &self.current_target,
+            self.position_secs,
+            rapid_second_click,
+            &mut self.queue_history,
+            &mut self.queue,
+        ) {
+            PreviousStep::SeekToStart => {
+                self.last_prev_click_at = Some(Instant::now());
+                self.seek_absolute(0.0, cx);
+            }
+            PreviousStep::PlayTrack(prev) => {
+                self.last_prev_click_at = None;
+                self.play_queue_item(prev, cx);
+            }
+            PreviousStep::CycleFavorite => {
+                self.last_prev_click_at = None;
+                self.cycle_favorite(-1, cx);
+            }
         }
     }
 
@@ -921,6 +966,8 @@ impl VibesCore {
             self.show_toast("Station has an empty stream URL", cx);
             return;
         }
+        self.queue_history.clear();
+        self.last_prev_click_at = None;
         self.current_target = Some(PlayTarget::Radio(station.clone()));
         self.state.last_played = self.current_target.clone();
         self.persist_state();
@@ -966,6 +1013,7 @@ impl VibesCore {
 
     pub fn play_youtube(&mut self, item: YoutubeItem, cx: &mut Context<Self>) {
         self.save_current_yt_resume();
+        self.last_prev_click_at = None;
         let resume = self.state.resume_positions.get(&item.id).copied();
         self.current_target = Some(PlayTarget::Youtube(item.clone()));
         self.state.last_played = self.current_target.clone();
@@ -1018,6 +1066,7 @@ impl VibesCore {
             return;
         }
         self.save_current_yt_resume();
+        self.last_prev_click_at = None;
         self.current_target = Some(PlayTarget::Local(track.clone()));
         self.state.last_played = self.current_target.clone();
         self.persist_state();
@@ -1064,6 +1113,11 @@ impl VibesCore {
         let Some(first) = tracks.get(start_idx).cloned() else {
             return;
         };
+        self.queue_history = tracks[..start_idx]
+            .iter()
+            .cloned()
+            .map(QueueItem::Local)
+            .collect();
         self.queue = tracks[start_idx + 1..]
             .iter()
             .cloned()
@@ -2030,7 +2084,7 @@ impl VibesCore {
                     .and_then(|u| self.art_path_for_url(u).cloned())
             });
 
-        let resolve_item = |tr: &AlbumTrack| -> QueueItem {
+        let resolve_item = |idx: usize, tr: &AlbumTrack| -> QueueItem {
             if let Some(path) = local_dir
                 .as_deref()
                 .and_then(|d| find_local_track_in_dir(d, tr.track_number, &tr.title))
@@ -2055,23 +2109,29 @@ impl VibesCore {
                     cover_path: track_cover,
                 });
             }
-            if let Some(u) = youtube_thumb_url(&tr.video_id) {
+            if idx >= start_idx
+                && let Some(u) = youtube_thumb_url(&tr.video_id)
+            {
                 self.prefetch_art_url(&u, COVER_MAX_DIM);
             }
             QueueItem::Youtube(Self::track_to_yt_item(tr))
         };
 
-        let mut items: Vec<QueueItem> = details.tracks[start_idx..]
+        let mut all_items: Vec<QueueItem> = details
+            .tracks
             .iter()
-            .map(resolve_item)
+            .enumerate()
+            .map(|(i, tr)| resolve_item(i, tr))
             .collect();
-        if items.is_empty() {
+        let mut tail = all_items.split_off(start_idx);
+        if tail.is_empty() {
             return;
         }
-        let all_local = items.iter().all(QueueItem::is_local);
-        let first = items.remove(0);
+        let first = tail.remove(0);
         let first_local = first.is_local();
-        self.queue = items;
+        let all_local = first_local && tail.iter().all(QueueItem::is_local);
+        self.queue_history = all_items;
+        self.queue = tail;
         self.play_queue_item(first, cx);
         if first_local {
             self.show_toast(
@@ -2587,16 +2647,34 @@ impl VibesCore {
                 {
                     self.selected_local_album = None;
                 }
-                if let Some(PlayTarget::Local(ref mut cur)) = self.current_target
-                    && cur.cover_path.is_none()
-                {
-                    cur.cover_path = snapshot
-                        .albums
-                        .iter()
-                        .flat_map(|a| a.tracks.iter())
-                        .chain(snapshot.singles.iter())
-                        .find(|t| t.path == cur.path)
-                        .and_then(|t| t.cover_path.clone());
+                if let Some(PlayTarget::Local(ref mut cur)) = self.current_target {
+                    if cur.cover_path.is_none() {
+                        cur.cover_path = snapshot
+                            .albums
+                            .iter()
+                            .flat_map(|a| a.tracks.iter())
+                            .chain(snapshot.singles.iter())
+                            .find(|t| t.path == cur.path)
+                            .and_then(|t| t.cover_path.clone());
+                    }
+                    if gen_id == 1 && self.queue.is_empty() && self.queue_history.is_empty() {
+                        for album in &snapshot.albums {
+                            if let Some(idx) = album.tracks.iter().position(|t| t.path == cur.path)
+                            {
+                                self.queue_history = album.tracks[..idx]
+                                    .iter()
+                                    .cloned()
+                                    .map(QueueItem::Local)
+                                    .collect();
+                                self.queue = album.tracks[idx + 1..]
+                                    .iter()
+                                    .cloned()
+                                    .map(QueueItem::Local)
+                                    .collect();
+                                break;
+                            }
+                        }
+                    }
                 }
                 self.local_library = snapshot;
                 if self.window_open {
@@ -2701,6 +2779,72 @@ impl VibesCore {
     }
 }
 
+const MAX_QUEUE_HISTORY: usize = 200;
+const PREV_RESTART_THRESHOLD_SECS: f64 = 3.0;
+const PREV_DOUBLE_CLICK_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq)]
+enum PreviousStep {
+    SeekToStart,
+    PlayTrack(QueueItem),
+    CycleFavorite,
+}
+
+fn target_as_queue_item(target: &Option<PlayTarget>) -> Option<QueueItem> {
+    match target {
+        Some(PlayTarget::Youtube(y)) => Some(QueueItem::Youtube(y.clone())),
+        Some(PlayTarget::Local(t)) => Some(QueueItem::Local(t.clone())),
+        _ => None,
+    }
+}
+
+fn push_queue_history(history: &mut Vec<QueueItem>, item: QueueItem) {
+    history.push(item);
+    if history.len() > MAX_QUEUE_HISTORY {
+        let excess = history.len() - MAX_QUEUE_HISTORY;
+        history.drain(..excess);
+    }
+}
+
+fn step_queue_next(
+    current: &Option<PlayTarget>,
+    history: &mut Vec<QueueItem>,
+    queue: &mut Vec<QueueItem>,
+) -> Option<QueueItem> {
+    if queue.is_empty() {
+        return None;
+    }
+    if let Some(cur) = target_as_queue_item(current) {
+        push_queue_history(history, cur);
+    }
+    Some(queue.remove(0))
+}
+
+fn step_queue_previous(
+    current: &Option<PlayTarget>,
+    position_secs: f64,
+    rapid_second_click: bool,
+    history: &mut Vec<QueueItem>,
+    queue: &mut Vec<QueueItem>,
+) -> PreviousStep {
+    if matches!(
+        current,
+        Some(PlayTarget::Youtube(_) | PlayTarget::Local(_))
+    ) {
+        if position_secs > PREV_RESTART_THRESHOLD_SECS && !rapid_second_click {
+            return PreviousStep::SeekToStart;
+        }
+        if let Some(prev) = history.pop() {
+            if let Some(cur) = target_as_queue_item(current) {
+                queue.insert(0, cur);
+            }
+            return PreviousStep::PlayTrack(prev);
+        }
+        return PreviousStep::SeekToStart;
+    }
+    PreviousStep::CycleFavorite
+}
+
 /// Steps volume onto crisp 5% increments in `0.0..=100.0`.
 pub fn step_volume_5(current: f64, up: bool) -> f64 {
     let clamped = current.clamp(0.0, 100.0);
@@ -2723,6 +2867,26 @@ pub fn step_volume_5(current: f64, up: bool) -> f64 {
 mod tests {
     use super::*;
 
+    fn dummy_track(n: u32) -> LocalTrack {
+        LocalTrack {
+            path: PathBuf::from(format!("/music/Album/{n:02} Track {n}.opus")),
+            title: format!("Track {n}"),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            track_number: Some(n),
+            duration_secs: Some(180.0),
+            format: "OPUS".to_string(),
+            cover_path: None,
+        }
+    }
+
+    fn as_target(item: &QueueItem) -> Option<PlayTarget> {
+        match item {
+            QueueItem::Youtube(y) => Some(PlayTarget::Youtube(y.clone())),
+            QueueItem::Local(t) => Some(PlayTarget::Local(t.clone())),
+        }
+    }
+
     #[test]
     fn steps_volume_in_clean_five_percent_increments() {
         assert_eq!(step_volume_5(80.0, true), 85.0);
@@ -2735,5 +2899,165 @@ mod tests {
         assert_eq!(step_volume_5(100.0, true), 100.0);
         assert_eq!(step_volume_5(2.0, false), 0.0);
         assert_eq!(step_volume_5(0.0, false), 0.0);
+    }
+
+    #[test]
+    fn album_forward_and_back_preserves_track_order() {
+        let t1 = QueueItem::Local(dummy_track(1));
+        let t2 = QueueItem::Local(dummy_track(2));
+        let t3 = QueueItem::Local(dummy_track(3));
+        let mut current = as_target(&t1);
+        let mut history = Vec::new();
+        let mut queue = vec![t2.clone(), t3.clone()];
+
+        // Forward 1 -> 2 -> 3
+        let next2 = step_queue_next(&current, &mut history, &mut queue).unwrap();
+        assert_eq!(next2, t2);
+        current = as_target(&next2);
+
+        let next3 = step_queue_next(&current, &mut history, &mut queue).unwrap();
+        assert_eq!(next3, t3);
+        current = as_target(&next3);
+        assert!(queue.is_empty());
+        assert_eq!(history, vec![t1.clone(), t2.clone()]);
+
+        // Back 3 -> 2 -> 1
+        let prev2 = match step_queue_previous(&current, 1.0, false, &mut history, &mut queue) {
+            PreviousStep::PlayTrack(it) => it,
+            other => panic!("expected PlayTrack(t2), got {other:?}"),
+        };
+        assert_eq!(prev2, t2);
+        current = as_target(&prev2);
+        assert_eq!(queue, vec![t3.clone()]);
+
+        let prev1 = match step_queue_previous(&current, 0.5, false, &mut history, &mut queue) {
+            PreviousStep::PlayTrack(it) => it,
+            other => panic!("expected PlayTrack(t1), got {other:?}"),
+        };
+        assert_eq!(prev1, t1);
+        current = as_target(&prev1);
+        assert!(history.is_empty());
+        assert_eq!(queue, vec![t2.clone(), t3.clone()]);
+
+        // Forward again 1 -> 2 -> 3
+        let again2 = step_queue_next(&current, &mut history, &mut queue).unwrap();
+        assert_eq!(again2, t2);
+        current = as_target(&again2);
+        let again3 = step_queue_next(&current, &mut history, &mut queue).unwrap();
+        assert_eq!(again3, t3);
+        assert!(queue.is_empty());
+        assert_eq!(history, vec![t1, t2]);
+    }
+
+    #[test]
+    fn mid_album_back_steps_to_start_and_never_cycles_favorites() {
+        let t1 = QueueItem::Local(dummy_track(1));
+        let t2 = QueueItem::Local(dummy_track(2));
+        let t3 = QueueItem::Local(dummy_track(3));
+        let t4 = QueueItem::Local(dummy_track(4));
+
+        let mut current = as_target(&t3);
+        let mut history = vec![t1.clone(), t2.clone()];
+        let mut queue = vec![t4.clone()];
+
+        let back2 = match step_queue_previous(&current, 0.0, false, &mut history, &mut queue) {
+            PreviousStep::PlayTrack(it) => it,
+            other => panic!("expected t2, got {other:?}"),
+        };
+        assert_eq!(back2, t2);
+        current = as_target(&back2);
+
+        let back1 = match step_queue_previous(&current, 0.0, false, &mut history, &mut queue) {
+            PreviousStep::PlayTrack(it) => it,
+            other => panic!("expected t1, got {other:?}"),
+        };
+        assert_eq!(back1, t1);
+        current = as_target(&back1);
+        assert!(history.is_empty());
+        assert_eq!(queue, vec![t2, t3, t4]);
+
+        // At track 1 with empty history, pressing Back restarts track 1 rather than jumping to radio.
+        assert_eq!(
+            step_queue_previous(&current, 1.0, false, &mut history, &mut queue),
+            PreviousStep::SeekToStart
+        );
+        assert_eq!(
+            step_queue_previous(&current, 20.0, true, &mut history, &mut queue),
+            PreviousStep::SeekToStart
+        );
+    }
+
+    #[test]
+    fn previous_threshold_and_rapid_double_click_behave_cleanly() {
+        let t1 = QueueItem::Local(dummy_track(1));
+        let t2 = QueueItem::Local(dummy_track(2));
+        let current = as_target(&t2);
+        let mut history = vec![t1.clone()];
+        let mut queue = Vec::new();
+
+        // Single click past 3s restarts current track without disturbing history or queue.
+        assert_eq!(
+            step_queue_previous(&current, 25.0, false, &mut history, &mut queue),
+            PreviousStep::SeekToStart
+        );
+        assert_eq!(history, vec![t1.clone()]);
+        assert!(queue.is_empty());
+
+        // Rapid second click (even if mpv IPC still reports 25.0s) steps back to t1 and re-queues t2.
+        assert_eq!(
+            step_queue_previous(&current, 25.0, true, &mut history, &mut queue),
+            PreviousStep::PlayTrack(t1)
+        );
+        assert!(history.is_empty());
+        assert_eq!(queue, vec![t2]);
+    }
+
+    #[test]
+    fn radio_and_empty_target_cycle_favorites_on_previous() {
+        let radio = RadioStation {
+            stationuuid: "u1".to_string(),
+            name: "Station".to_string(),
+            url: "https://example.com/stream".to_string(),
+            url_resolved: String::new(),
+            favicon: String::new(),
+            tags: String::new(),
+            country: String::new(),
+            countrycode: String::new(),
+            codec: String::new(),
+            bitrate: 128,
+            votes: 0,
+            clickcount: 0,
+            hls: 0,
+        };
+        let mut history = Vec::new();
+        let mut queue = Vec::new();
+        assert_eq!(
+            step_queue_previous(
+                &Some(PlayTarget::Radio(radio)),
+                10.0,
+                false,
+                &mut history,
+                &mut queue
+            ),
+            PreviousStep::CycleFavorite
+        );
+        assert_eq!(
+            step_queue_previous(&None, 0.0, false, &mut history, &mut queue),
+            PreviousStep::CycleFavorite
+        );
+    }
+
+    #[test]
+    fn push_queue_history_caps_at_max_entries() {
+        let mut history = Vec::new();
+        for n in 1..=(MAX_QUEUE_HISTORY as u32 + 5) {
+            push_queue_history(&mut history, QueueItem::Local(dummy_track(n)));
+        }
+        assert_eq!(history.len(), MAX_QUEUE_HISTORY);
+        assert_eq!(history.first(), Some(&QueueItem::Local(dummy_track(6))));
+        assert_eq!(
+            history.last(),
+            Some(&QueueItem::Local(dummy_track(MAX_QUEUE_HISTORY as u32 + 5)))
+        );
     }
 }

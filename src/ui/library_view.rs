@@ -457,7 +457,6 @@ pub fn render_queue_view(
                         .duration_secs()
                         .map(format_duration)
                         .unwrap_or_else(|| if is_local { "LOCAL".to_string() } else { "AUDIO".to_string() });
-                    let item_play = item;
 
                     div()
                         .id(SharedString::from(format!("q-row-{ix}")))
@@ -543,10 +542,8 @@ pub fn render_queue_view(
                                                 .icon(IconName::Play)
                                                 .label("Play")
                                                 .on_click(cx.listener(move |_, _, _, cx| {
-                                                    let it = item_play.clone();
                                                     core_play.update(cx, |c, cx| {
-                                                        c.remove_queue_index(ix, cx);
-                                                        c.play_queue_item(it, cx);
+                                                        c.play_queue_index(ix, cx);
                                                     });
                                                 })),
                                         )

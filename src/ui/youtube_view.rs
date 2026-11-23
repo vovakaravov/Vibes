@@ -220,7 +220,7 @@ pub fn render_youtube_view(
                         .hover(|s| s.bg(hsla(pal.bg_panel)))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             let it = item_play.clone();
-                            core_play.update(cx, |c, cx| c.play_youtube(it, cx));
+                            core_play.update(cx, |c, cx| c.play_youtube_standalone(it, cx));
                         }))
                         .child(
                             h_flex()
