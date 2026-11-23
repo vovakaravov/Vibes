@@ -1,4 +1,4 @@
-use super::VibesWindow;
+use super::{VibesWindow, art};
 use crate::config::PlayTarget;
 use crate::theme::{hsla, rgb_with_alpha};
 use crate::youtube::format_duration;
@@ -115,7 +115,11 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
     let playing = core.playing;
     let paused = core.paused;
     let buffering = core.buffering;
-    let is_youtube = matches!(core.current_target, Some(PlayTarget::Youtube(_)));
+    let is_local = matches!(core.current_target, Some(PlayTarget::Local(_)));
+    let is_seekable = matches!(
+        core.current_target,
+        Some(PlayTarget::Youtube(_) | PlayTarget::Local(_))
+    );
     let pos = core.position_secs;
     let dur = core.duration_secs;
     let vol = core.volume;
@@ -125,6 +129,7 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
     let can_save = core.can_save_current_song();
     let saving = core.active_saving_count() > 0;
     let vis_enabled = core.config.visualizer_enabled;
+    let lyrics_open = core.lyrics_open;
 
     let (primary_title, sub_title, fav_station, is_fav) = match &core.current_target {
         Some(PlayTarget::Radio(s)) => {
@@ -134,18 +139,53 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
             (track, s.name.clone(), Some(s.clone()), core.is_favorite(s))
         }
         Some(PlayTarget::Youtube(y)) => (y.title.clone(), y.channel.clone(), None, false),
+        Some(PlayTarget::Local(t)) => {
+            let sub = if t.album.is_empty() {
+                t.artist.clone()
+            } else {
+                format!("{} · {}", t.artist, t.album)
+            };
+            (t.title.clone(), sub, None, false)
+        }
         None => (
-            "Select a Radio Station or YouTube Audio".to_string(),
+            "Select Radio, Local Library, or YouTube Audio".to_string(),
             "Ready".to_string(),
             None,
             false,
         ),
     };
 
+    let (now_art, now_icon, now_seed) = match &core.current_target {
+        Some(PlayTarget::Local(t)) => {
+            let seed = if t.album.is_empty() {
+                t.title.clone()
+            } else {
+                t.album.clone()
+            };
+            (t.cover_path.clone(), IconName::Music, seed)
+        }
+        Some(PlayTarget::Youtube(y)) => (
+            core.art_path_for_youtube(&y.id).cloned(),
+            IconName::Headphones,
+            y.title.clone(),
+        ),
+        Some(PlayTarget::Radio(s)) => (
+            core.art_path_for_url(&s.favicon).cloned(),
+            IconName::Radio,
+            s.name.clone(),
+        ),
+        None => (None, IconName::Radio, "Vibes".to_string()),
+    };
+
     let mut telemetry = Vec::new();
-    if buffering && playing && !paused {
+    if is_local && playing {
+        telemetry.push("LOCAL".to_string());
+        if paused {
+            telemetry.push("PAUSED".to_string());
+        }
+    } else if buffering && playing && !paused {
         telemetry.push("BUFFERING".to_string());
-    } else if !is_youtube && playing {
+    } else if !is_seekable && playing {
         telemetry.push(if paused { "PAUSED" } else { "LIVE" }.to_string());
     }
     if let Some(ref c) = core.codec {
@@ -175,6 +215,7 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
     let core_fav = win.core.clone();
     let core_spd = win.core.clone();
     let core_slp = win.core.clone();
+    let core_lyr = win.core.clone();
     let core_mute = win.core.clone();
     let core_vol_scroll = win.core.clone();
     let core_cmp = win.core.clone();
@@ -201,7 +242,7 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
         .px_4()
         .py(px(if compact { 8. } else { 10. }))
         .gap_2()
-        .when(is_youtube, |deck| {
+        .when(is_seekable, |deck| {
             deck.child(
                 h_flex()
                     .w_full()
@@ -271,6 +312,15 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                         .min_w_0()
                         .items_center()
                         .gap_2p5()
+                        .child(art::render_art_tile(
+                            now_art.as_ref(),
+                            if compact { 36. } else { 52. },
+                            7.,
+                            now_icon,
+                            &now_seed,
+                            playing,
+                            &pal,
+                        ))
                         .when(vis_enabled, |r| r.child(render_spectrum_canvas(win, cx, compact)))
                         .child(
                             v_flex()
@@ -303,7 +353,9 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                                     .rounded(px(4.))
                                                     .bg(hsla(pal.bg_panel))
                                                     .text_size(px(9.5))
-                                                    .text_color(hsla(if buffering {
+                                                    .text_color(hsla(if is_local {
+                                                        pal.green
+                                                    } else if buffering {
                                                         pal.yellow
                                                     } else {
                                                         pal.aqua
@@ -326,11 +378,11 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                     .small()
                                     .icon(IconName::SkipBack)
                                     .on_click(cx.listener(move |_, _, _, cx| {
-                                        core_prev.update(cx, |c, cx| c.cycle_favorite(-1, cx));
+                                        core_prev.update(cx, |c, cx| c.play_previous_action(cx));
                                     })),
                             )
                         })
-                        .when(is_youtube, |r| {
+                        .when(is_seekable, |r| {
                             r.child(
                                 Button::new("deck-rw15")
                                     .ghost()
@@ -355,7 +407,7 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                     core_play.update(cx, |c, cx| c.toggle_play(cx));
                                 })),
                         )
-                        .when(is_youtube, |r| {
+                        .when(is_seekable, |r| {
                             r.child(
                                 Button::new("deck-ff30")
                                     .ghost()
@@ -386,7 +438,7 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                         core_stop.update(cx, |c, cx| c.stop_playback(cx));
                                     })),
                             )
-                            .when(!is_youtube && playing, |row| {
+                            .when(!is_seekable && playing, |row| {
                                 row.child(
                                     Button::new("deck-reconnect")
                                         .ghost()
@@ -436,7 +488,7 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                     })),
                             )
                         })
-                        .when(is_youtube && !compact, |r| {
+                        .when(is_seekable && !compact, |r| {
                             r.child(
                                 Button::new("deck-speed")
                                     .ghost()
@@ -449,6 +501,20 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                         })
                         .when(!compact, |r| {
                             r.child(
+                                Button::new("deck-lyrics")
+                                    .with_variant(if lyrics_open {
+                                        ButtonVariant::Primary
+                                    } else {
+                                        ButtonVariant::Ghost
+                                    })
+                                    .xsmall()
+                                    .icon(IconName::Mic)
+                                    .label("Lyrics")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        core_lyr.update(cx, |c, cx| c.toggle_lyrics_panel(cx));
+                                    })),
+                            )
+                            .child(
                                 Button::new("deck-sleep")
                                     .ghost()
                                     .xsmall()

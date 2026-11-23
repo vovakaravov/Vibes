@@ -1,4 +1,4 @@
-use super::VibesWindow;
+use super::{VibesWindow, art};
 use crate::config::PlayTarget;
 use crate::radio::GENRE_CHIPS;
 use crate::theme::{hsla, rgb_with_alpha};
@@ -20,7 +20,7 @@ pub fn render_radio_view(
     let (
         pal,
         selected_genre,
-        stations,
+        stations_with_art,
         loading,
         err_msg,
         active_url,
@@ -34,10 +34,15 @@ pub fn render_radio_view(
             Some(PlayTarget::Radio(s)) => Some(s.stream_url().to_lowercase()),
             _ => None,
         };
+        let list: Vec<(crate::radio::RadioStation, Option<std::path::PathBuf>)> = core
+            .stations
+            .iter()
+            .map(|s| (s.clone(), core.art_path_for_url(&s.favicon).cloned()))
+            .collect();
         (
             core.palette.clone(),
             core.selected_genre.clone(),
-            core.stations.clone(),
+            list,
             core.radio_loading,
             core.radio_error.clone(),
             active_url,
@@ -233,7 +238,7 @@ pub fn render_radio_view(
                 .min_h_0()
                 .gap_1()
                 .overflow_y_scrollbar()
-                .when(loading && stations.is_empty(), |list| {
+                .when(loading && stations_with_art.is_empty(), |list| {
                     list.child(
                         div()
                             .p_6()
@@ -242,7 +247,7 @@ pub fn render_radio_view(
                             .child("Loading global stations from RadioBrowser…"),
                     )
                 })
-                .when(!loading && stations.is_empty(), |list| {
+                .when(!loading && stations_with_art.is_empty(), |list| {
                     list.child(
                         div()
                             .p_6()
@@ -251,7 +256,7 @@ pub fn render_radio_view(
                             .child("No stations matched. Try another search or genre chip."),
                     )
                 })
-                .children(stations.into_iter().enumerate().map(|(ix, station)| {
+                .children(stations_with_art.into_iter().enumerate().map(|(ix, (station, favicon_path))| {
                     let is_active = active_url
                         .as_deref()
                         .is_some_and(|u| u == station.stream_url().to_lowercase());
@@ -306,49 +311,43 @@ pub fn render_radio_view(
                                         .min_w_0()
                                         .items_center()
                                         .gap_2p5()
-                                        .child(
-                                            div()
-                                                .w(px(26.))
-                                                .h(px(26.))
-                                                .rounded(px(6.))
-                                                .bg(hsla(if is_active {
-                                                    pal.accent
-                                                } else {
-                                                    pal.bg_btn
-                                                }))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(
-                                                    Icon::new(if is_active && playing {
-                                                        IconName::AudioLines
-                                                    } else {
-                                                        IconName::Play
-                                                    })
-                                                    .xsmall()
-                                                    .text_color(hsla(if is_active {
-                                                        pal.bg_deep
-                                                    } else {
-                                                        pal.fg_subtle
-                                                    })),
-                                                ),
-                                        )
+                                        .child(art::render_art_tile(
+                                            favicon_path.as_ref(),
+                                            38.,
+                                            7.,
+                                            IconName::Radio,
+                                            &station.name,
+                                            is_active,
+                                            &pal,
+                                        ))
                                         .child(
                                             v_flex()
                                                 .flex_1()
                                                 .min_w_0()
                                                 .gap_0p5()
                                                 .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(hsla(if is_active {
-                                                            pal.accent
-                                                        } else {
-                                                            pal.fg
-                                                        }))
-                                                        .truncate()
-                                                        .child(station.name.clone()),
+                                                    h_flex()
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        .when(is_active && playing, |r| {
+                                                            r.child(
+                                                                Icon::new(IconName::AudioLines)
+                                                                    .xsmall()
+                                                                    .text_color(hsla(pal.accent)),
+                                                            )
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(hsla(if is_active {
+                                                                    pal.accent
+                                                                } else {
+                                                                    pal.fg
+                                                                }))
+                                                                .truncate()
+                                                                .child(station.name.clone()),
+                                                        ),
                                                 )
                                                 .child(
                                                     div()

@@ -1,4 +1,8 @@
+pub mod albums_view;
+pub mod art;
 pub mod library_view;
+pub mod local_view;
+pub mod lyrics_view;
 pub mod player_deck;
 pub mod radio_view;
 pub mod sidebar;
@@ -13,7 +17,8 @@ use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Render, Styled, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    ParentElement, Render, ScrollHandle, Styled, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -25,15 +30,22 @@ pub struct VibesWindow {
     pub core: Entity<VibesCore>,
     pub radio_search_input: Entity<InputState>,
     pub yt_search_input: Entity<InputState>,
+    pub album_search_input: Entity<InputState>,
+    pub local_search_input: Entity<InputState>,
     pub custom_name_input: Entity<InputState>,
     pub custom_url_input: Entity<InputState>,
     pub country_input: Entity<InputState>,
     pub music_dir_input: Entity<InputState>,
+    pub albums_dir_input: Entity<InputState>,
     pub show_custom_station: bool,
     pub seek_geo: Rc<Cell<(f32, f32)>>,
     pub vol_geo: Rc<Cell<(f32, f32)>>,
     pub dragging_seek: bool,
     pub dragging_vol: bool,
+    pub image_cache: Entity<art::LruImageCache>,
+    pub lyrics_scroll: ScrollHandle,
+    pub last_scrolled_lyric_idx: Option<usize>,
+    pub last_lyrics_key: Option<String>,
     focus_handle: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -53,6 +65,8 @@ impl VibesWindow {
         let cfg = core.read(cx).config.clone();
         let initial_radio_q = core.read(cx).radio_query.clone();
         let initial_yt_q = core.read(cx).yt_query.clone();
+        let initial_alb_q = core.read(cx).album_query.clone();
+        let initial_loc_q = core.read(cx).local_filter_query.clone();
 
         let radio_search_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -63,6 +77,16 @@ impl VibesWindow {
             InputState::new(window, cx)
                 .placeholder("Search YouTube Music, mixes, podcasts, or paste a URL (Enter)…")
                 .default_value(initial_yt_q)
+        });
+        let album_search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search official albums (Artist Album) or paste playlist URL (Enter)…")
+                .default_value(initial_alb_q)
+        });
+        let local_search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Filter offline albums, artists, or saved tracks…")
+                .default_value(initial_loc_q)
         });
         let custom_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Station name (e.g. SomaFM Groove Salad)")
@@ -79,6 +103,11 @@ impl VibesWindow {
             InputState::new(window, cx)
                 .placeholder("~/Music/Radio")
                 .default_value(cfg.music_dir.display().to_string())
+        });
+        let albums_dir_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("~/Music")
+                .default_value(cfg.albums_dir.display().to_string())
         });
 
         let mut subs = Vec::new();
@@ -100,6 +129,26 @@ impl VibesWindow {
                 if matches!(ev, InputEvent::PressEnter { .. }) {
                     let q = inp.read(cx).value().to_string();
                     core_y.update(cx, |c, cx| c.search_youtube_query(q, cx));
+                }
+            }),
+        );
+
+        let core_a = core.clone();
+        subs.push(
+            cx.subscribe_in(&album_search_input, window, move |_, inp, ev, _, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    let q = inp.read(cx).value().to_string();
+                    core_a.update(cx, |c, cx| c.search_albums_query(q, cx));
+                }
+            }),
+        );
+
+        let core_l = core.clone();
+        subs.push(
+            cx.subscribe_in(&local_search_input, window, move |_, inp, ev, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let q = inp.read(cx).value().to_string();
+                    core_l.update(cx, |c, cx| c.set_local_filter_query(q, cx));
                 }
             }),
         );
@@ -131,20 +180,28 @@ impl VibesWindow {
 
         let fh = cx.focus_handle();
         fh.focus(window, cx);
+        let image_cache = art::LruImageCache::new(96, cx);
 
         Self {
             core,
             radio_search_input,
             yt_search_input,
+            album_search_input,
+            local_search_input,
             custom_name_input,
             custom_url_input,
             country_input,
             music_dir_input,
+            albums_dir_input,
             show_custom_station: false,
             seek_geo: Rc::new(Cell::new((0.0, 200.0))),
             vol_geo: Rc::new(Cell::new((0.0, 88.0))),
             dragging_seek: false,
             dragging_vol: false,
+            image_cache,
+            lyrics_scroll: ScrollHandle::new(),
+            last_scrolled_lyric_idx: None,
+            last_lyrics_key: None,
             focus_handle: fh,
             _subs: subs,
         }
@@ -204,10 +261,13 @@ impl VibesWindow {
     fn any_input_focused(&self, window: &Window, cx: &App) -> bool {
         self.radio_search_input.focus_handle(cx).is_focused(window)
             || self.yt_search_input.focus_handle(cx).is_focused(window)
+            || self.album_search_input.focus_handle(cx).is_focused(window)
+            || self.local_search_input.focus_handle(cx).is_focused(window)
             || self.custom_name_input.focus_handle(cx).is_focused(window)
             || self.custom_url_input.focus_handle(cx).is_focused(window)
             || self.country_input.focus_handle(cx).is_focused(window)
             || self.music_dir_input.focus_handle(cx).is_focused(window)
+            || self.albums_dir_input.focus_handle(cx).is_focused(window)
     }
 
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -248,6 +308,10 @@ impl VibesWindow {
                 cx.stop_propagation();
                 self.core.update(cx, |c, cx| c.toggle_mute(cx));
             }
+            "l" => {
+                cx.stop_propagation();
+                self.core.update(cx, |c, cx| c.toggle_lyrics_panel(cx));
+            }
             "left" => {
                 cx.stop_propagation();
                 self.core.update(cx, |c, cx| c.seek_relative(-5.0, cx));
@@ -268,7 +332,7 @@ impl VibesWindow {
 
 impl Render for VibesWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (pal, compact, section, toast, mpv_err) = {
+        let (pal, compact, section, toast, mpv_err, lyrics_open) = {
             let core = self.core.read(cx);
             (
                 core.palette.clone(),
@@ -276,11 +340,13 @@ impl Render for VibesWindow {
                 core.section,
                 core.toast.clone(),
                 core.mpv_error.clone(),
+                core.lyrics_open,
             )
         };
 
         if compact {
             return v_flex()
+                .image_cache(self.image_cache.clone())
                 .id("vibes-compact-root")
                 .track_focus(&self.focus_handle)
                 .size_full()
@@ -421,6 +487,8 @@ impl Render for VibesWindow {
         let main_stage = match section {
             NavSection::Radio => radio_view::render_radio_view(self, window, cx).into_any_element(),
             NavSection::Youtube => youtube_view::render_youtube_view(self, window, cx).into_any_element(),
+            NavSection::Albums => albums_view::render_albums_view(self, window, cx).into_any_element(),
+            NavSection::Library => local_view::render_local_view(self, window, cx).into_any_element(),
             NavSection::Favorites => library_view::render_favorites_view(self, cx).into_any_element(),
             NavSection::SongLog => library_view::render_song_log_view(self, cx).into_any_element(),
             NavSection::Queue => library_view::render_queue_view(self, cx).into_any_element(),
@@ -429,6 +497,7 @@ impl Render for VibesWindow {
         };
 
         v_flex()
+            .image_cache(self.image_cache.clone())
             .id("vibes-root")
             .track_focus(&self.focus_handle)
             .size_full()
@@ -458,7 +527,10 @@ impl Render for VibesWindow {
                             .h_full()
                             .bg(hsla(pal.bg_main))
                             .child(main_stage),
-                    ),
+                    )
+                    .when(lyrics_open, |row| {
+                        row.child(lyrics_view::render_lyrics_panel(self, cx))
+                    }),
             )
             .child(player_deck::render_player_deck(self, cx))
             .into_any_element()

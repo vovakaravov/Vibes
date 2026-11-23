@@ -1,4 +1,4 @@
-use super::VibesWindow;
+use super::{VibesWindow, art};
 use crate::config::PlayTarget;
 use crate::theme::{hsla, rgb_with_alpha};
 use crate::youtube::{YoutubeFilter, format_duration};
@@ -17,16 +17,23 @@ pub fn render_youtube_view(
     _window: &mut Window,
     cx: &mut Context<VibesWindow>,
 ) -> impl IntoElement {
-    let (pal, results, filter, loading, err_msg, active_url, recent, resume_map) = {
+    let (pal, filtered, filter, loading, err_msg, active_url, recent, resume_map) = {
         let core = win.core.read(cx);
         let active_url = match &core.current_target {
             Some(PlayTarget::Youtube(y)) => Some(y.url.clone()),
             _ => None,
         };
+        let filter = core.yt_filter;
+        let filtered: Vec<(crate::youtube::YoutubeItem, Option<std::path::PathBuf>)> = core
+            .yt_results
+            .iter()
+            .filter(|i| filter.matches(i))
+            .map(|i| (i.clone(), core.art_path_for_youtube(&i.id).cloned()))
+            .collect();
         (
             core.palette.clone(),
-            core.yt_results.clone(),
-            core.yt_filter,
+            filtered,
+            filter,
             core.yt_loading,
             core.yt_error.clone(),
             active_url,
@@ -34,8 +41,6 @@ pub fn render_youtube_view(
             core.state.resume_positions.clone(),
         )
     };
-
-    let filtered: Vec<_> = results.into_iter().filter(|i| filter.matches(i)).collect();
     let core_go = win.core.clone();
 
     v_flex()
@@ -176,7 +181,7 @@ pub fn render_youtube_view(
                             .child("Search for music mixes, podcasts, or paste any YouTube link to stream audio-only via mpv."),
                     )
                 })
-                .children(filtered.into_iter().enumerate().map(|(ix, item)| {
+                .children(filtered.into_iter().enumerate().map(|(ix, (item, thumb_path))| {
                     let is_active = active_url.as_deref() == Some(item.url.as_str());
                     let saved_pos = resume_map.get(&item.id).copied();
                     let core_play = win.core.clone();
@@ -223,47 +228,64 @@ pub fn render_youtube_view(
                                 .items_center()
                                 .gap_3()
                                 .child(
-                                    v_flex()
+                                    h_flex()
                                         .flex_1()
                                         .min_w_0()
-                                        .gap_0p5()
+                                        .items_center()
+                                        .gap_2p5()
+                                        .child(art::render_art_rect(
+                                            thumb_path.as_ref(),
+                                            64.,
+                                            36.,
+                                            5.,
+                                            IconName::Headphones,
+                                            &item.title,
+                                            is_active,
+                                            &pal,
+                                        ))
                                         .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(hsla(if is_active {
-                                                    pal.accent
-                                                } else {
-                                                    pal.fg
-                                                }))
-                                                .truncate()
-                                                .child(item.title.clone()),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_2()
-                                                .items_center()
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_0p5()
                                                 .child(
                                                     div()
-                                                        .text_xs()
-                                                        .text_color(hsla(pal.fg_muted))
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(hsla(if is_active {
+                                                            pal.accent
+                                                        } else {
+                                                            pal.fg
+                                                        }))
                                                         .truncate()
-                                                        .child(item.channel.clone()),
+                                                        .child(item.title.clone()),
                                                 )
-                                                .when_some(saved_pos, |r, pos| {
-                                                    r.child(
-                                                        div()
-                                                            .px_1p5()
-                                                            .rounded(px(4.))
-                                                            .bg(hsla(pal.bg_panel))
-                                                            .text_size(px(10.))
-                                                            .text_color(hsla(pal.yellow))
-                                                            .child(format!(
-                                                                "Resume {}",
-                                                                format_duration(pos)
-                                                            )),
-                                                    )
-                                                }),
+                                                .child(
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(hsla(pal.fg_muted))
+                                                                .truncate()
+                                                                .child(item.channel.clone()),
+                                                        )
+                                                        .when_some(saved_pos, |r, pos| {
+                                                            r.child(
+                                                                div()
+                                                                    .px_1p5()
+                                                                    .rounded(px(4.))
+                                                                    .bg(hsla(pal.bg_panel))
+                                                                    .text_size(px(10.))
+                                                                    .text_color(hsla(pal.yellow))
+                                                                    .child(format!(
+                                                                        "Resume {}",
+                                                                        format_duration(pos)
+                                                                    )),
+                                                            )
+                                                        }),
+                                                ),
                                         ),
                                 )
                                 .child(

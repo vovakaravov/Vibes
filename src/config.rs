@@ -1,3 +1,4 @@
+use crate::local_library::LocalTrack;
 use crate::radio::RadioStation;
 use crate::theme::ThemePreset;
 use crate::youtube::YoutubeItem;
@@ -67,6 +68,26 @@ impl SaveAudioFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AlbumFolderMode {
+    #[default]
+    ArtistAndAlbum,
+    AlbumPrefix,
+    ArtistDashAlbum,
+}
+
+impl AlbumFolderMode {
+    pub const ALL: [Self; 3] = [Self::ArtistAndAlbum, Self::AlbumPrefix, Self::ArtistDashAlbum];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ArtistAndAlbum => "Artist / Album",
+            Self::AlbumPrefix => "Album - Name",
+            Self::ArtistDashAlbum => "Artist - Album",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VibesConfig {
     #[serde(default)]
@@ -87,6 +108,10 @@ pub struct VibesConfig {
     pub save_folder_mode: SaveFolderMode,
     #[serde(default)]
     pub save_audio_format: SaveAudioFormat,
+    #[serde(default = "default_albums_dir")]
+    pub albums_dir: PathBuf,
+    #[serde(default)]
+    pub album_folder_mode: AlbumFolderMode,
 }
 
 fn default_true() -> bool {
@@ -97,11 +122,14 @@ fn default_volume() -> f64 {
     80.0
 }
 
-fn default_music_dir() -> PathBuf {
+fn default_albums_dir() -> PathBuf {
     dirs::audio_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Radio")
+}
+
+fn default_music_dir() -> PathBuf {
+    default_albums_dir().join("Radio")
 }
 
 fn default_country_code() -> String {
@@ -129,6 +157,8 @@ impl Default for VibesConfig {
             music_dir: default_music_dir(),
             save_folder_mode: SaveFolderMode::Flat,
             save_audio_format: SaveAudioFormat::Opus,
+            albums_dir: default_albums_dir(),
+            album_folder_mode: AlbumFolderMode::ArtistAndAlbum,
         }
     }
 }
@@ -145,6 +175,7 @@ pub struct SongLogEntry {
 pub enum PlayTarget {
     Radio(RadioStation),
     Youtube(YoutubeItem),
+    Local(LocalTrack),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -234,6 +265,8 @@ mod tests {
             music_dir: tmp.path().join("Music"),
             save_folder_mode: SaveFolderMode::ByArtist,
             save_audio_format: SaveAudioFormat::Opus,
+            albums_dir: tmp.path().join("Albums"),
+            album_folder_mode: AlbumFolderMode::AlbumPrefix,
         };
         atomic_write_json(&cfg_file, &cfg).unwrap();
         let parsed_cfg: VibesConfig =

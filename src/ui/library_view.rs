@@ -1,6 +1,7 @@
-use super::VibesWindow;
-use crate::config::{SaveAudioFormat, SaveFolderMode};
-use crate::core::NavSection;
+use super::{VibesWindow, art};
+use crate::albums::AlbumDownloadStatus;
+use crate::config::{AlbumFolderMode, SaveAudioFormat, SaveFolderMode};
+use crate::core::{NavSection, QueueItem};
 use crate::downloader::DownloadStatus;
 use crate::theme::{ThemePreset, hsla, rgb_with_alpha};
 use crate::youtube::format_duration;
@@ -21,7 +22,13 @@ pub fn render_favorites_view(
 ) -> impl IntoElement {
     let (pal, favorites) = {
         let core = win.core.read(cx);
-        (core.palette.clone(), core.state.favorites.clone())
+        let list: Vec<(crate::radio::RadioStation, Option<PathBuf>)> = core
+            .state
+            .favorites
+            .iter()
+            .map(|st| (st.clone(), core.art_path_for_url(&st.favicon).cloned()))
+            .collect();
+        (core.palette.clone(), list)
     };
     let fav_len = favorites.len();
 
@@ -68,7 +75,7 @@ pub fn render_favorites_view(
                             .child("Star any radio station to pin it here and in your KDE system tray Favorites menu."),
                     )
                 })
-                .children(favorites.into_iter().enumerate().map(|(ix, st)| {
+                .children(favorites.into_iter().enumerate().map(|(ix, (st, fav_art))| {
                     let core_play = win.core.clone();
                     let core_up = win.core.clone();
                     let core_dn = win.core.clone();
@@ -107,6 +114,15 @@ pub fn render_favorites_view(
                                         .min_w_0()
                                         .gap_2p5()
                                         .items_center()
+                                        .child(art::render_art_tile(
+                                            fav_art.as_ref(),
+                                            38.,
+                                            6.,
+                                            IconName::Radio,
+                                            &st.name,
+                                            false,
+                                            &pal,
+                                        ))
                                         .child(
                                             div()
                                                 .px_1p5()
@@ -271,23 +287,42 @@ pub fn render_song_log_view(
                                 .items_center()
                                 .gap_3()
                                 .child(
-                                    v_flex()
+                                    h_flex()
                                         .flex_1()
                                         .min_w_0()
+                                        .items_center()
+                                        .gap_2p5()
+                                        .child(art::render_art_tile(
+                                            None,
+                                            32.,
+                                            6.,
+                                            IconName::Music,
+                                            &entry.track,
+                                            false,
+                                            &pal,
+                                        ))
                                         .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(hsla(pal.fg))
-                                                .truncate()
-                                                .child(entry.track),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(hsla(pal.fg_muted))
-                                                .truncate()
-                                                .child(format!("{} · {}", entry.station, entry.timestamp)),
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(hsla(pal.fg))
+                                                        .truncate()
+                                                        .child(entry.track),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(hsla(pal.fg_muted))
+                                                        .truncate()
+                                                        .child(format!(
+                                                            "{} · {}",
+                                                            entry.station, entry.timestamp
+                                                        )),
+                                                ),
                                         ),
                                 )
                                 .child(
@@ -349,7 +384,18 @@ pub fn render_queue_view(
 ) -> impl IntoElement {
     let (pal, queue) = {
         let core = win.core.read(cx);
-        (core.palette.clone(), core.queue.clone())
+        let q: Vec<(QueueItem, Option<PathBuf>)> = core
+            .queue
+            .iter()
+            .map(|it| {
+                let art = match it {
+                    QueueItem::Local(t) => t.cover_path.clone(),
+                    QueueItem::Youtube(y) => core.art_path_for_youtube(&y.id).cloned(),
+                };
+                (it.clone(), art)
+            })
+            .collect();
+        (core.palette.clone(), q)
     };
     let core_clr = win.core.clone();
 
@@ -398,17 +444,20 @@ pub fn render_queue_view(
                             .p_6()
                             .text_xs()
                             .text_color(hsla(pal.fg_muted))
-                            .child("Queue is empty. Add tracks or podcasts from YouTube Audio using +Queue."),
+                            .child("Queue is empty. Add tracks from Local Library, Albums, or YouTube Audio using +Queue."),
                     )
                 })
-                .children(queue.into_iter().enumerate().map(|(ix, item)| {
+                .children(queue.into_iter().enumerate().map(|(ix, (item, art_path))| {
                     let core_play = win.core.clone();
                     let core_rm = win.core.clone();
-                    let item_play = item.clone();
+                    let is_local = item.is_local();
+                    let title_txt = item.title().to_string();
+                    let sub_txt = item.subtitle();
                     let dur_txt = item
-                        .duration_secs
+                        .duration_secs()
                         .map(format_duration)
-                        .unwrap_or_else(|| "AUDIO".to_string());
+                        .unwrap_or_else(|| if is_local { "LOCAL".to_string() } else { "AUDIO".to_string() });
+                    let item_play = item;
 
                     div()
                         .id(SharedString::from(format!("q-row-{ix}")))
@@ -425,23 +474,63 @@ pub fn render_queue_view(
                                 .items_center()
                                 .gap_3()
                                 .child(
-                                    v_flex()
+                                    h_flex()
                                         .flex_1()
                                         .min_w_0()
+                                        .items_center()
+                                        .gap_2p5()
+                                        .child(art::render_art_tile(
+                                            art_path.as_ref(),
+                                            36.,
+                                            6.,
+                                            if is_local {
+                                                IconName::Music
+                                            } else {
+                                                IconName::Headphones
+                                            },
+                                            &title_txt,
+                                            false,
+                                            &pal,
+                                        ))
                                         .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(hsla(pal.fg))
-                                                .truncate()
-                                                .child(item.title.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(hsla(pal.fg_muted))
-                                                .truncate()
-                                                .child(format!("{} · {dur_txt}", item.channel)),
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_weight(FontWeight::MEDIUM)
+                                                                .text_color(hsla(pal.fg))
+                                                                .truncate()
+                                                                .child(title_txt),
+                                                        )
+                                                        .when(is_local, |r| {
+                                                            r.child(
+                                                                div()
+                                                                    .px_1p5()
+                                                                    .py_0p5()
+                                                                    .rounded(px(4.))
+                                                                    .bg(rgb_with_alpha(
+                                                                        pal.green, 0x26,
+                                                                    ))
+                                                                    .text_size(px(9.))
+                                                                    .font_weight(FontWeight::BOLD)
+                                                                    .text_color(hsla(pal.green))
+                                                                    .child("LOCAL"),
+                                                            )
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(hsla(pal.fg_muted))
+                                                        .truncate()
+                                                        .child(format!("{sub_txt} · {dur_txt}")),
+                                                ),
                                         ),
                                 )
                                 .child(
@@ -457,7 +546,7 @@ pub fn render_queue_view(
                                                     let it = item_play.clone();
                                                     core_play.update(cx, |c, cx| {
                                                         c.remove_queue_index(ix, cx);
-                                                        c.play_youtube(it, cx);
+                                                        c.play_queue_item(it, cx);
                                                     });
                                                 })),
                                         )
@@ -482,16 +571,56 @@ pub fn render_downloads_view(
     win: &mut VibesWindow,
     cx: &mut Context<VibesWindow>,
 ) -> impl IntoElement {
-    let (pal, jobs, music_dir, fmt_label) = {
+    let (pal, jobs, album_jobs, music_dir, albums_dir, fmt_label) = {
         let core = win.core.read(cx);
+        let jobs_with_art: Vec<(crate::downloader::DownloadJob, Option<PathBuf>)> = core
+            .downloads
+            .iter()
+            .map(|j| {
+                let art = match &j.status {
+                    DownloadStatus::Saved(p) | DownloadStatus::AlreadyExists(p) => core
+                        .local_library
+                        .singles
+                        .iter()
+                        .find(|t| &t.path == p)
+                        .and_then(|t| t.cover_path.clone()),
+                    _ => None,
+                };
+                (j.clone(), art)
+            })
+            .collect();
+        let alb_jobs_with_art: Vec<(crate::albums::AlbumDownloadJob, Option<PathBuf>)> = core
+            .album_downloads
+            .iter()
+            .map(|j| {
+                let art = j
+                    .details
+                    .cover_url
+                    .as_deref()
+                    .or(j.details.summary.cover_url.as_deref())
+                    .and_then(|u| core.art_path_for_url(u).cloned())
+                    .or_else(|| {
+                        core.local_library
+                            .albums
+                            .iter()
+                            .find(|a| a.folder == j.folder)
+                            .and_then(|a| a.cover_path.clone())
+                    });
+                (j.clone(), art)
+            })
+            .collect();
         (
             core.palette.clone(),
-            core.downloads.clone(),
+            jobs_with_art,
+            alb_jobs_with_art,
             core.config.music_dir.display().to_string(),
+            core.config.albums_dir.clone(),
             core.config.save_audio_format.label(),
         )
     };
     let core_open = win.core.clone();
+    let core_open_alb = win.core.clone();
+    let albums_root = albums_dir.clone();
 
     v_flex()
         .size_full()
@@ -513,25 +642,42 @@ pub fn render_downloads_view(
                                         .text_base()
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(hsla(pal.fg))
-                                        .child("Saved Songs via yt-dlp"),
+                                        .child("Saved Songs & Albums"),
                                 ),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(hsla(pal.fg_muted))
-                                .child(format!("Saving {fmt_label} cleanly into {music_dir}")),
+                                .child(format!(
+                                    "Format: {fmt_label} · Songs -> {music_dir} · Albums -> {}",
+                                    albums_dir.display()
+                                )),
                         ),
                 )
                 .child(
-                    Button::new("open-music-folder")
-                        .secondary()
-                        .small()
-                        .icon(IconName::Folder)
-                        .label("Open Music Folder")
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            core_open.read(cx).open_music_folder();
-                        })),
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Button::new("open-albums-folder")
+                                .secondary()
+                                .small()
+                                .icon(IconName::Disc3)
+                                .label("Albums Folder")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_open_alb.read(cx).open_folder(&albums_root);
+                                })),
+                        )
+                        .child(
+                            Button::new("open-music-folder")
+                                .secondary()
+                                .small()
+                                .icon(IconName::Folder)
+                                .label("Radio Songs")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_open.read(cx).open_music_folder();
+                                })),
+                        ),
                 ),
         )
         .child(
@@ -540,16 +686,155 @@ pub fn render_downloads_view(
                 .min_h_0()
                 .gap_1p5()
                 .overflow_y_scrollbar()
-                .when(jobs.is_empty(), |list| {
+                .when(jobs.is_empty() && album_jobs.is_empty(), |list| {
                     list.child(
                         div()
                             .p_6()
                             .text_xs()
                             .text_color(hsla(pal.fg_muted))
-                            .child("When an identifiable song is playing on radio (or in YouTube Audio), click Save Song (or press Ctrl+S) to fetch the clean full track via yt-dlp directly into your library."),
+                            .child("Download complete tagged albums from the Albums tab, or click Save Song (Ctrl+S) while listening to Radio / YouTube Audio."),
                     )
                 })
-                .children(jobs.into_iter().enumerate().map(|(ix, job)| {
+                .children(album_jobs.into_iter().enumerate().map(|(ix, (job, job_art))| {
+                    let job_id = job.id;
+                    let can_retry = matches!(
+                        job.status,
+                        AlbumDownloadStatus::Failed(_)
+                            | AlbumDownloadStatus::Completed {
+                                failed: 1..,
+                                ..
+                            }
+                    );
+                    let (status_txt, status_col) = match &job.status {
+                        AlbumDownloadStatus::Queued => {
+                            ("Fetching official cover art & preparing album folder…".to_string(), pal.yellow)
+                        }
+                        AlbumDownloadStatus::Downloading {
+                            completed,
+                            total,
+                            current_track,
+                        } => (
+                            format!("Downloading track {}/{}: {current_track}", completed + 1, total),
+                            pal.accent,
+                        ),
+                        AlbumDownloadStatus::Completed {
+                            saved,
+                            skipped,
+                            failed,
+                            ..
+                        } => (
+                            format!(
+                                "Album complete · {saved} saved, {skipped} skipped, {failed} failed"
+                            ),
+                            if *failed > 0 { pal.yellow } else { pal.green },
+                        ),
+                        AlbumDownloadStatus::Failed(e) => (format!("Failed: {e}"), pal.red),
+                    };
+                    let core_retry = win.core.clone();
+                    let core_folder = win.core.clone();
+                    let folder_path = job.folder.clone();
+                    let title_line = match job.year {
+                        Some(y) => format!("{} — {} ({y})", job.artist, job.title),
+                        None => format!("{} — {}", job.artist, job.title),
+                    };
+
+                    div()
+                        .id(SharedString::from(format!("alb-dl-row-{ix}")))
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(7.))
+                        .bg(hsla(pal.bg_panel))
+                        .border_1()
+                        .border_color(hsla(pal.border))
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_2p5()
+                                        .child(art::render_art_tile(
+                                            job_art.as_ref(),
+                                            44.,
+                                            6.,
+                                            IconName::Disc3,
+                                            &job.title,
+                                            false,
+                                            &pal,
+                                        ))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_1()
+                                                .child(
+                                                    h_flex()
+                                                        .justify_between()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(hsla(pal.fg))
+                                                                .truncate()
+                                                                .child(title_line),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.5))
+                                                                .text_color(hsla(pal.fg_muted))
+                                                                .child(job.created_at),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(hsla(status_col))
+                                                        .truncate()
+                                                        .child(status_txt),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .flex_shrink_0()
+                                        .when(can_retry, |r| {
+                                            r.child(
+                                                Button::new(SharedString::from(format!(
+                                                    "alb-retry-{ix}"
+                                                )))
+                                                .secondary()
+                                                .xsmall()
+                                                .icon(IconName::RefreshCw)
+                                                .label("Resume")
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    core_retry.update(cx, |c, cx| {
+                                                        c.retry_album_download(job_id, cx)
+                                                    });
+                                                })),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "alb-open-{ix}"
+                                            )))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Folder)
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                core_folder.read(cx).open_folder(&folder_path);
+                                            })),
+                                        ),
+                                ),
+                        )
+                }))
+                .children(jobs.into_iter().enumerate().map(|(ix, (job, song_art))| {
                     let is_failed = matches!(job.status, DownloadStatus::Failed(_));
                     let job_id = job.id;
                     let core_retry = win.core.clone();
@@ -582,38 +867,55 @@ pub fn render_downloads_view(
                                 .items_center()
                                 .gap_3()
                                 .child(
-                                    v_flex()
+                                    h_flex()
                                         .flex_1()
                                         .min_w_0()
-                                        .gap_1()
+                                        .items_center()
+                                        .gap_2p5()
+                                        .child(art::render_art_tile(
+                                            song_art.as_ref(),
+                                            36.,
+                                            6.,
+                                            IconName::Music,
+                                            &job.label,
+                                            false,
+                                            &pal,
+                                        ))
                                         .child(
-                                            h_flex()
-                                                .justify_between()
-                                                .items_center()
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_1()
                                                 .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(hsla(pal.fg))
-                                                        .truncate()
-                                                        .child(job.label),
+                                                    h_flex()
+                                                        .justify_between()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(hsla(pal.fg))
+                                                                .truncate()
+                                                                .child(job.label),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.5))
+                                                                .text_color(hsla(pal.fg_muted))
+                                                                .child(format!(
+                                                                    "from {} · {}",
+                                                                    job.source_station,
+                                                                    job.created_at
+                                                                )),
+                                                        ),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_size(px(10.5))
-                                                        .text_color(hsla(pal.fg_muted))
-                                                        .child(format!(
-                                                            "from {} · {}",
-                                                            job.source_station, job.created_at
-                                                        )),
+                                                        .text_xs()
+                                                        .text_color(hsla(status_col))
+                                                        .truncate()
+                                                        .child(status_txt),
                                                 ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(hsla(status_col))
-                                                .truncate()
-                                                .child(status_txt),
                                         ),
                                 )
                                 .when(is_failed, |r| {
@@ -639,9 +941,13 @@ pub fn render_settings_view(
     win: &mut VibesWindow,
     cx: &mut Context<VibesWindow>,
 ) -> impl IntoElement {
-    let (pal, cfg) = {
+    let (pal, cfg, backfill) = {
         let core = win.core.read(cx);
-        (core.palette.clone(), core.config.clone())
+        (
+            core.palette.clone(),
+            core.config.clone(),
+            core.lyrics_backfill.clone(),
+        )
     };
 
     let core_cc = win.core.clone();
@@ -649,8 +955,16 @@ pub fn render_settings_view(
     let core_vis = win.core.clone();
     let core_tray = win.core.clone();
     let core_dir = win.core.clone();
+    let core_alb_dir = win.core.clone();
     let core_f1 = win.core.clone();
     let core_f2 = win.core.clone();
+    let core_lyr_backfill = win.core.clone();
+    let backfill_active = backfill.active;
+    let backfill_text = if backfill_active || backfill.processed > 0 {
+        backfill.summary()
+    } else {
+        "Scans your Music & Albums folders, skips tracks that already have embedded lyrics, and embeds synced/plain LRCLIB lyrics in place.".to_string()
+    };
 
     v_flex()
         .size_full()
@@ -914,12 +1228,126 @@ pub fn render_settings_view(
                 ),
         )
         .child(
+            v_flex()
+                .p_3p5()
+                .gap_2p5()
+                .rounded(px(8.))
+                .bg(hsla(pal.bg_sidebar))
+                .border_1()
+                .border_color(hsla(pal.border_subtle))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(hsla(pal.fg))
+                        .child("Full Albums Library"),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(hsla(pal.fg_subtle))
+                                .child("Albums base directory:"),
+                        )
+                        .child(div().flex_1().child(Input::new(&win.albums_dir_input).small()))
+                        .child(
+                            Button::new("save-albums-dir")
+                                .secondary()
+                                .xsmall()
+                                .label("Apply")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let p = this.albums_dir_input.read(cx).value().trim().to_string();
+                                    if !p.is_empty() {
+                                        core_alb_dir.update(cx, |c, cx| {
+                                            c.set_albums_dir(PathBuf::from(p), cx)
+                                        });
+                                    }
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .flex_wrap()
+                        .children(AlbumFolderMode::ALL.into_iter().map(|mode| {
+                            let active = mode == cfg.album_folder_mode;
+                            let core_ent = win.core.clone();
+                            Button::new(SharedString::from(format!("alb-mode-{}", mode.label())))
+                                .with_variant(if active {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .xsmall()
+                                .label(mode.label())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_ent.update(cx, |c, cx| c.set_album_folder_mode(mode, cx));
+                                }))
+                        })),
+                ),
+        )
+        .child(
+            v_flex()
+                .p_3p5()
+                .gap_2p5()
+                .rounded(px(8.))
+                .bg(hsla(pal.bg_sidebar))
+                .border_1()
+                .border_color(hsla(pal.border_subtle))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(hsla(pal.fg))
+                        .child("Embedded Lyrics (LRCLIB)"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(if backfill_active {
+                            pal.yellow
+                        } else {
+                            pal.fg_subtle
+                        }))
+                        .child(backfill_text),
+                )
+                .child(
+                    h_flex().child(
+                        Button::new("settings-lyrics-backfill")
+                            .with_variant(if backfill_active {
+                                ButtonVariant::Danger
+                            } else {
+                                ButtonVariant::Secondary
+                            })
+                            .xsmall()
+                            .icon(IconName::Mic)
+                            .label(if backfill_active {
+                                "Cancel"
+                            } else {
+                                "Fetch & Embed Missing Lyrics"
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                core_lyr_backfill.update(cx, |c, cx| {
+                                    if c.lyrics_backfill.active {
+                                        c.cancel_lyrics_backfill(cx);
+                                    } else {
+                                        c.start_lyrics_backfill(cx);
+                                    }
+                                });
+                            })),
+                    ),
+                ),
+        )
+        .child(
             div()
                 .p_3()
                 .rounded(px(8.))
                 .bg(rgb_with_alpha(pal.accent, 0x16))
                 .text_xs()
                 .text_color(hsla(pal.fg_subtle))
-                .child("Shortcuts: Space Play/Pause · 1-9 Presets · Ctrl+S Save Song · Ctrl+M Compact Deck · M Mute · Left/Right Seek YT"),
+                .child("Shortcuts: Space Play/Pause · 1-9 Presets · L Lyrics · Ctrl+S Save Song · Ctrl+M Compact Deck · M Mute · Left/Right Seek YT"),
         )
 }

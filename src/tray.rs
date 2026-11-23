@@ -62,30 +62,87 @@ pub fn escape_menu_label(s: &str) -> String {
     s.replace('_', "__")
 }
 
-/// Maps `0..=100` volume + mute state to `0..=3` active radio wave rings.
-pub fn volume_wave_level(volume: f64, muted: bool) -> u8 {
+/// Maps `0..=100` volume + mute state to a normalized `0.0..=1.0` clockwise arc fraction.
+pub fn volume_arc_fraction(volume: f64, muted: bool) -> f32 {
     if muted || volume <= 0.5 {
-        0
-    } else if volume <= 33.0 {
-        1
-    } else if volume <= 66.0 {
-        2
+        0.0
     } else {
-        3
+        (volume.clamp(0.0, 100.0) / 100.0) as f32
     }
 }
 
-fn put_argb(data: &mut [u8], width: i32, x: i32, y: i32, argb: [u8; 4]) {
-    if x < 0 || y < 0 || x >= width || y >= width {
+fn alpha_byte(cov: f32, max_alpha: u8) -> u8 {
+    (cov * max_alpha as f32).round().clamp(0.0, 255.0) as u8
+}
+
+fn blend_argb(data: &mut [u8], width: i32, x: i32, y: i32, argb: [u8; 4]) {
+    if argb[0] == 0 || x < 0 || y < 0 || x >= width || y >= width {
         return;
     }
     let idx = ((y * width + x) * 4) as usize;
-    if argb[0] >= data[idx] {
-        data[idx] = argb[0];
-        data[idx + 1] = argb[1];
-        data[idx + 2] = argb[2];
-        data[idx + 3] = argb[3];
+    let sa = argb[0] as f32 / 255.0;
+    let da = data[idx] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        return;
     }
+    let inv_sa = da * (1.0 - sa);
+    for c in 0..3 {
+        let src = argb[c + 1] as f32;
+        let dst = data[idx + c + 1] as f32;
+        data[idx + c + 1] = ((src * sa + dst * inv_sa) / out_a)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    data[idx] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+fn disc_coverage(dist: f32, radius: f32) -> f32 {
+    (radius + 0.65 - dist).clamp(0.0, 1.0)
+}
+
+fn ring_coverage(dist: f32, radius: f32, half_width: f32) -> f32 {
+    (half_width + 0.65 - (dist - radius).abs()).clamp(0.0, 1.0)
+}
+
+fn arc_coverage(dx: f32, dy: f32, dist: f32, radius: f32, half_width: f32, sweep: f32) -> f32 {
+    if sweep <= 0.001 {
+        return 0.0;
+    }
+    let d_center = if sweep >= std::f32::consts::TAU - 0.01 {
+        (dist - radius).abs()
+    } else {
+        let angle_cw = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU);
+        if angle_cw <= sweep {
+            (dist - radius).abs()
+        } else {
+            let sx = 0.0;
+            let sy = -radius;
+            let ex = radius * sweep.sin();
+            let ey = -radius * sweep.cos();
+            let d_start = ((dx - sx) * (dx - sx) + (dy - sy) * (dy - sy)).sqrt();
+            let d_end = ((dx - ex) * (dx - ex) + (dy - ey) * (dy - ey)).sqrt();
+            d_start.min(d_end)
+        }
+    };
+    (half_width + 0.65 - d_center).clamp(0.0, 1.0)
+}
+
+fn rounded_rect_coverage(
+    px: f32,
+    py: f32,
+    cx: f32,
+    cy: f32,
+    half_w: f32,
+    half_h: f32,
+    radius: f32,
+) -> f32 {
+    let qx = (px - cx).abs() - (half_w - radius);
+    let qy = (py - cy).abs() - (half_h - radius);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    let sdf = outside + inside - radius;
+    (0.65 - sdf).clamp(0.0, 1.0)
 }
 
 fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
@@ -104,138 +161,304 @@ fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Generates a 32x32 ARGB32 (network byte order) tray icon reflecting playback state and volume.
+/// Generates a 32x32 ARGB32 (network byte order) circular vinyl disc + volume ring tray icon.
 pub fn render_tray_icon(state: TrayPlaybackState, volume: f64, muted: bool) -> ksni::Icon {
     const W: i32 = 32;
+    const CX: f32 = 15.5;
+    const CY: f32 = 15.5;
+    const R_RING: f32 = 12.8;
+    const RING_HALF: f32 = 1.65;
+    const R_DISC: f32 = 8.6;
+
     let mut data = vec![0u8; (W * W * 4) as usize];
+    let vol_frac = volume_arc_fraction(volume, muted);
 
-    match state {
-        TrayPlaybackState::Idle => {
-            let cx = 15.5f32;
-            let cy = 15.5f32;
-            for y in 0..W {
-                for x in 0..W {
-                    let dx = (x as f32) - cx;
-                    let dy = (y as f32) - cy;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    if dist <= 12.2 {
-                        // Subtle translucent badge fill
-                        put_argb(&mut data, W, x, y, [75, 0x28, 0x27, 0x27]);
+    for y in 0..W {
+        for x in 0..W {
+            let xf = x as f32;
+            let yf = y as f32;
+            let dx = xf - CX;
+            let dy = yf - CY;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let track_cov = ring_coverage(dist, R_RING, RING_HALF);
+
+            match state {
+                TrayPlaybackState::Idle => {
+                    if track_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(track_cov, 145), 0x8a, 0x90, 0x9e],
+                        );
                     }
-                    let ring_d = (dist - 11.4).abs();
-                    if ring_d < 1.35 {
-                        let a = ((1.0 - ring_d / 1.35) * 200.0).round() as u8;
-                        put_argb(&mut data, W, x, y, [a, 0x72, 0x71, 0x69]);
+                    let disc_cov = disc_coverage(dist, R_DISC);
+                    if disc_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(disc_cov, 155), 0x2a, 0x2d, 0x36],
+                        );
                     }
-                    if dist <= 3.3 {
-                        let a = ((3.3 - dist).clamp(0.0, 1.0) * 235.0).round() as u8;
-                        put_argb(&mut data, W, x, y, [a, 0x8b, 0xa4, 0xb0]);
+                    let rim_cov = ring_coverage(dist, 8.1, 0.55);
+                    if rim_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(rim_cov, 115), 0x58, 0x5e, 0x6e],
+                        );
+                    }
+                    let hub_cov = disc_coverage(dist, 2.9);
+                    if hub_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(hub_cov, 190), 0x9e, 0x6b, 0x6b],
+                        );
+                    }
+                    let hole_cov = disc_coverage(dist, 1.2);
+                    if hole_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(hole_cov, 210), 0x1c, 0x1e, 0x24],
+                        );
                     }
                 }
-            }
-        }
-        TrayPlaybackState::Paused => {
-            let cx = 15.5f32;
-            let cy = 15.5f32;
-            for y in 0..W {
-                for x in 0..W {
-                    let xf = x as f32;
-                    let yf = y as f32;
-                    let dx = xf - cx;
-                    let dy = yf - cy;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    if dist <= 13.5 {
-                        put_argb(&mut data, W, x, y, [185, 0x24, 0x22, 0x20]);
+                TrayPlaybackState::Paused => {
+                    if track_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(track_cov, 130), 0x84, 0x8b, 0x99],
+                        );
                     }
-                    let ring_d = (dist - 13.0).abs();
-                    if ring_d < 1.3 {
-                        let a = ((1.0 - ring_d / 1.3) * 255.0).round() as u8;
-                        put_argb(&mut data, W, x, y, [a, 0xc4, 0xb2, 0x8a]);
-                    }
-                    // Two bold vertical pause bars
-                    let in_y = (9.5..=21.5).contains(&yf);
-                    let in_left_bar = (10.2..=13.8).contains(&xf) && in_y;
-                    let in_right_bar = (17.2..=20.8).contains(&xf) && in_y;
-                    if in_left_bar || in_right_bar {
-                        put_argb(&mut data, W, x, y, [255, 0xdc, 0xd7, 0xba]);
-                    }
-                }
-            }
-        }
-        TrayPlaybackState::Buffering | TrayPlaybackState::Playing => {
-            let is_buffering = state == TrayPlaybackState::Buffering;
-            let level = volume_wave_level(volume, muted);
-            let vol_norm = (volume.clamp(0.0, 100.0) / 100.0) as f32;
-            let cx = 15.5f32;
-            let cy = 24.5f32;
-
-            for y in 0..W {
-                for x in 0..W {
-                    let xf = x as f32;
-                    let yf = y as f32;
-                    let dx = xf - cx;
-                    let dy = yf - cy;
-                    let dist = (dx * dx + dy * dy).sqrt();
-
-                    // Center emitter dot
-                    if dist <= 3.4 {
-                        let fade = (3.4 - dist).clamp(0.0, 1.0);
-                        let (r, g, b, a_scale) = if is_buffering {
-                            (0xc4, 0xb2, 0x8a, 1.0)
-                        } else if level == 0 {
-                            (0x72, 0x71, 0x69, 0.7)
-                        } else {
-                            (0x87, 0xa9, 0x87, 1.0)
-                        };
-                        let a = (fade * a_scale * 255.0).round() as u8;
-                        put_argb(&mut data, W, x, y, [a, r, g, b]);
-                    } else if dy <= -0.5 && dx.abs() <= (-dy) * 1.48 {
-                        let bands: [(u8, f32, [u8; 3]); 3] = [
-                            (1, 7.2, [0x87, 0xa9, 0x87]),
-                            (2, 12.4, [0x8e, 0xa4, 0xa2]),
-                            (3, 17.6, [0xa3, 0xc4, 0xd4]),
-                        ];
-                        for (req_lvl, radius, lit_rgb) in bands {
-                            let ring_d = (dist - radius).abs();
-                            if ring_d < 1.35 {
-                                let aa = (1.0 - ring_d / 1.35).clamp(0.0, 1.0);
-                                let dash_skip =
-                                    is_buffering && ((xf + yf).round() as i32).rem_euclid(5) < 2;
-                                if is_buffering {
-                                    if !dash_skip {
-                                        let a = (aa * 235.0).round() as u8;
-                                        put_argb(&mut data, W, x, y, [a, 0xc4, 0xb2, 0x8a]);
-                                    }
-                                } else if level >= req_lvl {
-                                    let emphasis = if req_lvl == 3 {
-                                        0.78 + 0.22 * vol_norm
-                                    } else {
-                                        1.0
-                                    };
-                                    let a = (aa * emphasis * 255.0).round() as u8;
-                                    put_argb(
-                                        &mut data,
-                                        W,
-                                        x,
-                                        y,
-                                        [a, lit_rgb[0], lit_rgb[1], lit_rgb[2]],
-                                    );
-                                } else {
-                                    // Unlit wave ghost so full arc silhouette remains visible
-                                    let a = (aa * 56.0).round() as u8;
-                                    put_argb(&mut data, W, x, y, [a, 0x72, 0x71, 0x69]);
-                                }
-                                break;
-                            }
+                    if vol_frac > 0.0 {
+                        let sweep = vol_frac * std::f32::consts::TAU;
+                        let arc_cov = arc_coverage(dx, dy, dist, R_RING, RING_HALF, sweep);
+                        if arc_cov > 0.0 {
+                            blend_argb(
+                                &mut data,
+                                W,
+                                x,
+                                y,
+                                [alpha_byte(arc_cov, 200), 0xb8, 0xbf, 0xc9],
+                            );
                         }
+                    }
+                    let disc_cov = disc_coverage(dist, 8.8);
+                    if disc_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(disc_cov, 242), 0x23, 0x26, 0x2e],
+                        );
+                    }
+                    let rim_cov = ring_coverage(dist, 8.2, 0.55);
+                    if rim_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(rim_cov, 135), 0x55, 0x5b, 0x6b],
+                        );
+                    }
+                    let left_bar = rounded_rect_coverage(xf, yf, 12.55, 15.5, 1.35, 4.9, 0.9);
+                    let right_bar = rounded_rect_coverage(xf, yf, 18.45, 15.5, 1.35, 4.9, 0.9);
+                    let bar_cov = left_bar.max(right_bar);
+                    if bar_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(bar_cov, 255), 0xf2, 0xf4, 0xf8],
+                        );
+                    }
+                }
+                TrayPlaybackState::Buffering => {
+                    if track_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(track_cov, 110), 0x7f, 0x87, 0x96],
+                        );
+                    }
+                    let spinner_cov = arc_coverage(
+                        dx,
+                        dy,
+                        dist,
+                        R_RING,
+                        RING_HALF,
+                        250.0f32.to_radians(),
+                    );
+                    if spinner_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(spinner_cov, 255), 0xf6, 0xc4, 0x53],
+                        );
+                    }
+                    let disc_cov = disc_coverage(dist, R_DISC);
+                    if disc_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(disc_cov, 248), 0x24, 0x26, 0x2e],
+                        );
+                    }
+                    let groove_cov = ring_coverage(dist, 5.6, 0.45);
+                    if groove_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(groove_cov, 115), 0x5c, 0x62, 0x73],
+                        );
+                    }
+                    let label_cov = disc_coverage(dist, 3.1);
+                    if label_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(label_cov, 255), 0xf6, 0xc4, 0x53],
+                        );
+                    }
+                    let hole_cov = disc_coverage(dist, 1.2);
+                    if hole_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(hole_cov, 255), 0x1a, 0x1c, 0x22],
+                        );
+                    }
+                }
+                TrayPlaybackState::Playing => {
+                    if track_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(track_cov, 115), 0x7f, 0x87, 0x96],
+                        );
+                    }
+                    if vol_frac > 0.0 {
+                        let sweep = vol_frac * std::f32::consts::TAU;
+                        let arc_cov = arc_coverage(dx, dy, dist, R_RING, RING_HALF, sweep);
+                        if arc_cov > 0.0 {
+                            blend_argb(
+                                &mut data,
+                                W,
+                                x,
+                                y,
+                                [alpha_byte(arc_cov, 255), 0xff, 0x52, 0x52],
+                            );
+                        }
+                    }
+                    let disc_cov = disc_coverage(dist, R_DISC);
+                    if disc_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(disc_cov, 248), 0x24, 0x26, 0x2e],
+                        );
+                    }
+                    let rim_cov = ring_coverage(dist, 8.1, 0.5);
+                    if rim_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(rim_cov, 145), 0x4e, 0x54, 0x64],
+                        );
+                    }
+                    let groove_cov = ring_coverage(dist, 5.6, 0.45);
+                    if groove_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(groove_cov, 115), 0x63, 0x69, 0x7a],
+                        );
+                    }
+                    let label_cov = disc_coverage(dist, 3.1);
+                    if label_cov > 0.0 {
+                        let (max_a, rgb) = if vol_frac > 0.0 {
+                            (255u8, [0xe5, 0x39, 0x35])
+                        } else {
+                            (225u8, [0x72, 0x77, 0x82])
+                        };
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(label_cov, max_a), rgb[0], rgb[1], rgb[2]],
+                        );
+                    }
+                    let hole_cov = disc_coverage(dist, 1.2);
+                    if hole_cov > 0.0 {
+                        blend_argb(
+                            &mut data,
+                            W,
+                            x,
+                            y,
+                            [alpha_byte(hole_cov, 255), 0x1a, 0x1c, 0x22],
+                        );
                     }
 
                     // Bold mute slash when muted / 0% volume
-                    if !is_buffering && level == 0 {
-                        let slash_d = dist_to_segment(xf, yf, 6.0, 6.0, 25.0, 25.0);
+                    if vol_frac == 0.0 {
+                        let slash_d = dist_to_segment(xf, yf, 5.2, 5.2, 25.8, 25.8);
+                        if slash_d < 2.4 {
+                            let halo_cov = (2.4 - slash_d).clamp(0.0, 1.0);
+                            blend_argb(
+                                &mut data,
+                                W,
+                                x,
+                                y,
+                                [alpha_byte(halo_cov, 200), 0x18, 0x1a, 0x20],
+                            );
+                        }
                         if slash_d < 1.55 {
-                            let a = ((1.0 - slash_d / 1.55) * 250.0).round() as u8;
-                            put_argb(&mut data, W, x, y, [a, 0xc4, 0x74, 0x6e]);
+                            let slash_cov = (1.55 - slash_d).clamp(0.0, 1.0);
+                            blend_argb(
+                                &mut data,
+                                W,
+                                x,
+                                y,
+                                [alpha_byte(slash_cov, 255), 0xff, 0x52, 0x52],
+                            );
                         }
                     }
                 }
@@ -515,40 +738,114 @@ impl TrayController {
 mod tests {
     use super::*;
 
-    fn lit_pixel_count(icon: &ksni::Icon) -> usize {
-        icon.data.chunks_exact(4).filter(|px| px[0] > 140).count()
+    fn crimson_ring_pixels(icon: &ksni::Icon) -> usize {
+        let mut count = 0;
+        for y in 0..32i32 {
+            for x in 0..32i32 {
+                let dx = (x as f32) - 15.5;
+                let dy = (y as f32) - 15.5;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if !(10.5..=15.0).contains(&dist) {
+                    continue;
+                }
+                let idx = ((y * 32 + x) * 4) as usize;
+                let [a, r, g, _b] = [
+                    icon.data[idx],
+                    icon.data[idx + 1],
+                    icon.data[idx + 2],
+                    icon.data[idx + 3],
+                ];
+                if a > 160 && r > 200 && r > g.saturating_add(80) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn pixel_at(icon: &ksni::Icon, x: i32, y: i32) -> [u8; 4] {
+        let idx = ((y * 32 + x) * 4) as usize;
+        [
+            icon.data[idx],
+            icon.data[idx + 1],
+            icon.data[idx + 2],
+            icon.data[idx + 3],
+        ]
+    }
+
+    fn maybe_write_preview(dir: &str, name: &str, icon: &ksni::Icon) {
+        let _ = std::fs::create_dir_all(dir);
+        let mut rgba = Vec::with_capacity(icon.data.len());
+        for argb in icon.data.chunks_exact(4) {
+            rgba.extend_from_slice(&[argb[1], argb[2], argb[3], argb[0]]);
+        }
+        if let Some(img) =
+            image::RgbaImage::from_raw(icon.width as u32, icon.height as u32, rgba)
+        {
+            let _ = img.save(std::path::Path::new(dir).join(format!("{name}.png")));
+        }
     }
 
     #[test]
-    fn escapes_menu_underscores_and_renders_distinct_volume_modulated_icons() {
+    fn escapes_menu_underscores_and_renders_distinct_circular_volume_disc_icons() {
         assert_eq!(
             escape_menu_label("Lofi_Girl - Track_01"),
             "Lofi__Girl - Track__01"
         );
-        assert_eq!(volume_wave_level(0.0, false), 0);
-        assert_eq!(volume_wave_level(50.0, true), 0);
-        assert_eq!(volume_wave_level(20.0, false), 1);
-        assert_eq!(volume_wave_level(55.0, false), 2);
-        assert_eq!(volume_wave_level(90.0, false), 3);
+        assert_eq!(volume_arc_fraction(0.0, false), 0.0);
+        assert_eq!(volume_arc_fraction(50.0, true), 0.0);
+        assert!((volume_arc_fraction(25.0, false) - 0.25).abs() < 1e-6);
+        assert!((volume_arc_fraction(50.0, false) - 0.50).abs() < 1e-6);
+        assert!((volume_arc_fraction(100.0, false) - 1.0).abs() < 1e-6);
+        assert!((volume_arc_fraction(150.0, false) - 1.0).abs() < 1e-6);
 
         let idle = render_tray_icon(TrayPlaybackState::Idle, 80.0, false);
         let paused = render_tray_icon(TrayPlaybackState::Paused, 80.0, false);
         let buffering = render_tray_icon(TrayPlaybackState::Buffering, 80.0, false);
-        let low = render_tray_icon(TrayPlaybackState::Playing, 20.0, false);
-        let mid = render_tray_icon(TrayPlaybackState::Playing, 55.0, false);
-        let high = render_tray_icon(TrayPlaybackState::Playing, 100.0, false);
+        let v25 = render_tray_icon(TrayPlaybackState::Playing, 25.0, false);
+        let v50 = render_tray_icon(TrayPlaybackState::Playing, 50.0, false);
+        let v75 = render_tray_icon(TrayPlaybackState::Playing, 75.0, false);
+        let v100 = render_tray_icon(TrayPlaybackState::Playing, 100.0, false);
         let muted = render_tray_icon(TrayPlaybackState::Playing, 80.0, true);
 
-        for icon in [&idle, &paused, &buffering, &low, &mid, &high, &muted] {
+        let samples = [
+            ("idle", &idle),
+            ("paused", &paused),
+            ("buffering", &buffering),
+            ("playing_25", &v25),
+            ("playing_50", &v50),
+            ("playing_75", &v75),
+            ("playing_100", &v100),
+            ("muted", &muted),
+        ];
+
+        for (_, icon) in &samples {
             assert_eq!(icon.width, 32);
             assert_eq!(icon.height, 32);
             assert_eq!(icon.data.len(), 32 * 32 * 4);
         }
 
+        if let Ok(dir) = std::env::var("VIBES_TRAY_PREVIEW_DIR") {
+            for (name, icon) in &samples {
+                maybe_write_preview(&dir, name, icon);
+            }
+        }
+
         assert_ne!(idle.data, paused.data);
-        assert_ne!(paused.data, high.data);
-        assert_ne!(high.data, muted.data);
-        assert!(lit_pixel_count(&low) < lit_pixel_count(&mid));
-        assert!(lit_pixel_count(&mid) < lit_pixel_count(&high));
+        assert_ne!(paused.data, v100.data);
+        assert_ne!(v100.data, muted.data);
+        assert_ne!(buffering.data, v100.data);
+        assert_ne!(idle.data, muted.data);
+
+        assert!(crimson_ring_pixels(&muted) < crimson_ring_pixels(&v25));
+        assert!(crimson_ring_pixels(&v25) < crimson_ring_pixels(&v50));
+        assert!(crimson_ring_pixels(&v50) < crimson_ring_pixels(&v75));
+        assert!(crimson_ring_pixels(&v75) < crimson_ring_pixels(&v100));
+
+        // Center pixel: muted draws the red diagonal mute slash through the center; playing shows dark spindle hole.
+        let center_muted = pixel_at(&muted, 15, 15);
+        assert!(center_muted[0] > 200 && center_muted[1] > 180);
+        let center_playing = pixel_at(&v100, 15, 15);
+        assert!(center_playing[0] > 200 && center_playing[1] < 60);
     }
 }

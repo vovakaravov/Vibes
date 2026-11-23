@@ -1,10 +1,28 @@
+use crate::albums::{
+    AlbumDetails, AlbumDownloadJob, AlbumDownloadStatus, AlbumSummary, AlbumTrack,
+    fetch_album_details, resolve_album_dir, run_download_album, search_albums,
+};
+use crate::artwork::{
+    ArtworkFetcher, COVER_MAX_DIM, ICON_MAX_DIM, resolve_local_album_art, trim_allocator,
+    youtube_thumb_url,
+};
 use crate::config::{
-    PlayTarget, SaveAudioFormat, SaveFolderMode, SongLogEntry, VibesConfig, VibesState,
+    AlbumFolderMode, PlayTarget, SaveAudioFormat, SaveFolderMode, SongLogEntry, VibesConfig,
+    VibesState,
 };
 use crate::downloader::{
     DownloadJob, DownloadStatus, ParsedTrack, parse_identifiable_track, run_save_song,
 };
 use crate::instance::InstanceGuard;
+use crate::local_library::{
+    LocalAlbum, LocalLibrarySnapshot, LocalTrack, find_local_album_dir, find_local_track_in_dir,
+    scan_local_library,
+};
+use crate::lyrics::{
+    LyricsBackfillProgress, LyricsKind, LyricsOrigin, LyricsQuery, LyricsState,
+    active_synced_line_index, embed_lyrics_in_file, fetch_lrclib_lyrics, lrclib_to_document,
+    new_http_agent, parse_lyrics_text, read_embedded_lyrics, run_library_lyrics_backfill,
+};
 use crate::mpris::{MprisAction, MprisController, MprisSnapshot};
 use crate::mpv::{MpvController, MpvEvent};
 use crate::radio::{
@@ -16,9 +34,12 @@ use crate::visualizer::VisualizerController;
 use crate::youtube::{YoutubeFilter, YoutubeItem, format_duration, search_youtube};
 use chrono::Local;
 use gpui_kit::{App, ClipboardItem, Context};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -26,11 +47,52 @@ pub enum NavSection {
     #[default]
     Radio,
     Youtube,
+    Albums,
+    Library,
     Favorites,
     SongLog,
     Queue,
     Downloads,
     Settings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueueItem {
+    Youtube(YoutubeItem),
+    Local(LocalTrack),
+}
+
+impl QueueItem {
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Youtube(y) => &y.title,
+            Self::Local(t) => &t.title,
+        }
+    }
+
+    pub fn subtitle(&self) -> String {
+        match self {
+            Self::Youtube(y) => y.channel.clone(),
+            Self::Local(t) => {
+                if t.album.is_empty() {
+                    t.artist.clone()
+                } else {
+                    format!("{} · {}", t.artist, t.album)
+                }
+            }
+        }
+    }
+
+    pub fn duration_secs(&self) -> Option<f64> {
+        match self {
+            Self::Youtube(y) => y.duration_secs,
+            Self::Local(t) => t.duration_secs,
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +116,37 @@ enum CoreBgEvent {
         query: String,
         res: Result<Vec<YoutubeItem>, String>,
     },
+    AlbumsSearched {
+        gen_id: u64,
+        res: Result<Vec<AlbumSummary>, String>,
+    },
+    AlbumDetailsLoaded {
+        gen_id: u64,
+        auto_download: bool,
+        res: Result<AlbumDetails, String>,
+    },
+    AlbumDownloadProgress {
+        job_id: u64,
+        status: AlbumDownloadStatus,
+    },
+    LocalLibraryScanned {
+        gen_id: u64,
+        snapshot: LocalLibrarySnapshot,
+    },
+    ArtworkLoaded {
+        key: String,
+        path: PathBuf,
+    },
     SaveProgress {
         job_id: u64,
         status: DownloadStatus,
     },
+    LyricsLoaded {
+        gen_id: u64,
+        key: String,
+        state: LyricsState,
+    },
+    LyricsBackfillUpdated(LyricsBackfillProgress),
 }
 
 pub struct VibesCore {
@@ -84,6 +173,25 @@ pub struct VibesCore {
     pub yt_error: Option<String>,
     yt_fetch_gen: u64,
 
+    // Album search & download state
+    pub album_query: String,
+    pub album_results: Vec<AlbumSummary>,
+    pub album_loading: bool,
+    pub album_error: Option<String>,
+    album_fetch_gen: u64,
+    pub selected_album: Option<AlbumDetails>,
+    pub album_detail_loading: bool,
+    album_detail_gen: u64,
+    pub album_downloads: Vec<AlbumDownloadJob>,
+
+    // Local offline library state
+    pub local_library: LocalLibrarySnapshot,
+    pub local_library_loading: bool,
+    local_scan_gen: u64,
+    pub local_filter_query: String,
+    pub local_tab_singles: bool,
+    pub selected_local_album: Option<PathBuf>,
+
     // Playback state
     pub current_target: Option<PlayTarget>,
     pub playing: bool,
@@ -100,7 +208,7 @@ pub struct VibesCore {
     pub volume: f64,
     pub muted: bool,
     pub speed: f64,
-    pub queue: Vec<YoutubeItem>,
+    pub queue: Vec<QueueItem>,
     reconnect_attempts: u8,
     user_stopped: bool,
     last_resume_save_secs: f64,
@@ -115,7 +223,9 @@ pub struct VibesCore {
     pub sleep_deadline: Option<Instant>,
     last_sleep_mins_synced: Option<u64>,
 
-    // Subsystems
+    // Subsystems & caches
+    pub art_cache: HashMap<String, PathBuf>,
+    art_fetcher: ArtworkFetcher,
     mpv: Option<MpvController>,
     pub mpv_error: Option<String>,
     tray: TrayController,
@@ -125,6 +235,15 @@ pub struct VibesCore {
     window_tx: async_channel::Sender<WindowCmd>,
     bg_tx: async_channel::Sender<CoreBgEvent>,
     _instance_guard: Option<InstanceGuard>,
+
+    // Lyrics & backfill
+    pub lyrics_open: bool,
+    pub lyrics_state: LyricsState,
+    pub lyrics_track_key: Option<String>,
+    lyrics_fetch_gen: u64,
+    lyrics_cache: HashMap<String, LyricsState>,
+    pub lyrics_backfill: LyricsBackfillProgress,
+    lyrics_backfill_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl VibesCore {
@@ -151,6 +270,10 @@ impl VibesCore {
         let tray = TrayController::spawn(tray_tx);
         let mpris = MprisController::spawn(mpris_tx);
         let instance_guard = InstanceGuard::start(show_tx);
+        let bg_art = bg_tx.clone();
+        let art_fetcher = ArtworkFetcher::spawn(move |key, path| {
+            let _ = bg_art.send_blocking(CoreBgEvent::ArtworkLoaded { key, path });
+        });
 
         // Spawn channel listeners cleanly bound to Entity<VibesCore>
         cx.spawn(async move |weak, cx| {
@@ -255,6 +378,23 @@ impl VibesCore {
             yt_error: None,
             yt_fetch_gen: 0,
 
+            album_query: String::new(),
+            album_results: Vec::new(),
+            album_loading: false,
+            album_error: None,
+            album_fetch_gen: 0,
+            selected_album: None,
+            album_detail_loading: false,
+            album_detail_gen: 0,
+            album_downloads: Vec::new(),
+
+            local_library: LocalLibrarySnapshot::default(),
+            local_library_loading: false,
+            local_scan_gen: 0,
+            local_filter_query: String::new(),
+            local_tab_singles: false,
+            selected_local_album: None,
+
             current_target,
             playing: false,
             paused: false,
@@ -283,6 +423,8 @@ impl VibesCore {
             sleep_deadline: None,
             last_sleep_mins_synced: None,
 
+            art_cache: HashMap::new(),
+            art_fetcher,
             mpv,
             mpv_error,
             tray,
@@ -292,11 +434,66 @@ impl VibesCore {
             window_tx,
             bg_tx,
             _instance_guard: instance_guard,
+
+            lyrics_open: false,
+            lyrics_state: LyricsState::Empty,
+            lyrics_track_key: None,
+            lyrics_fetch_gen: 0,
+            lyrics_cache: HashMap::new(),
+            lyrics_backfill: LyricsBackfillProgress::default(),
+            lyrics_backfill_cancel: None,
         };
 
         core.sync_integrations();
+        core.refresh_visualizer_state();
+        core.prefetch_startup_art();
         core.refresh_radio_stations(cx);
+        core.refresh_local_library(cx);
         core
+    }
+
+    pub fn art_path_for_url(&self, url: &str) -> Option<&PathBuf> {
+        let key = url.trim();
+        if key.is_empty() {
+            None
+        } else {
+            self.art_cache.get(key)
+        }
+    }
+
+    pub fn art_path_for_youtube(&self, video_id: &str) -> Option<&PathBuf> {
+        let url = youtube_thumb_url(video_id)?;
+        self.art_cache.get(&url)
+    }
+
+    pub fn prefetch_art_url(&self, url: &str, max_dim: u32) {
+        self.art_fetcher.prefetch(url, max_dim);
+    }
+
+    fn prefetch_stations_art(&self, stations: &[RadioStation]) {
+        for s in stations {
+            self.prefetch_art_url(&s.favicon, ICON_MAX_DIM);
+        }
+    }
+
+    fn prefetch_target_art(&self, target: &PlayTarget) {
+        match target {
+            PlayTarget::Radio(s) => self.prefetch_art_url(&s.favicon, ICON_MAX_DIM),
+            PlayTarget::Youtube(y) => {
+                if let Some(u) = youtube_thumb_url(&y.id) {
+                    self.prefetch_art_url(&u, COVER_MAX_DIM);
+                }
+            }
+            PlayTarget::Local(_) => {}
+        }
+    }
+
+    fn prefetch_startup_art(&self) {
+        self.prefetch_stations_art(&self.stations);
+        self.prefetch_stations_art(&self.state.favorites);
+        if let Some(ref target) = self.current_target {
+            self.prefetch_target_art(target);
+        }
     }
 
     pub fn set_window_open(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -305,6 +502,14 @@ impl VibesCore {
         self.sync_integrations();
         if open {
             cx.notify();
+        } else {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                trim_allocator();
+            })
+            .detach();
         }
     }
 
@@ -347,9 +552,10 @@ impl VibesCore {
     }
 
     fn refresh_visualizer_state(&mut self) {
-        let should_run =
-            self.window_open && self.config.visualizer_enabled && self.playing && !self.paused;
-        self.visualizer.set_active(should_run);
+        let want_filter = self.window_open && self.config.visualizer_enabled;
+        let want_anim = want_filter && self.playing && !self.paused;
+        self.visualizer
+            .sync(want_filter, want_anim, self.mpv.as_ref());
     }
 
     pub fn current_track_text(&self) -> Option<String> {
@@ -364,6 +570,7 @@ impl VibesCore {
                 })
                 .map(|t| t.trim().to_string()),
             Some(PlayTarget::Youtube(y)) => Some(y.title.clone()),
+            Some(PlayTarget::Local(t)) => Some(t.title.clone()),
             None => None,
         }
     }
@@ -385,7 +592,7 @@ impl VibesCore {
                 );
                 Some((parsed, Some(yt.url.clone()), yt.channel.clone()))
             }
-            None => None,
+            Some(PlayTarget::Local(_)) | None => None,
         }
     }
 
@@ -394,7 +601,8 @@ impl VibesCore {
     }
 
     pub fn active_saving_count(&self) -> usize {
-        self.downloads
+        let songs = self
+            .downloads
             .iter()
             .filter(|j| {
                 matches!(
@@ -402,7 +610,18 @@ impl VibesCore {
                     DownloadStatus::Searching | DownloadStatus::Downloading(_)
                 )
             })
-            .count()
+            .count();
+        let albums = self
+            .album_downloads
+            .iter()
+            .filter(|j| {
+                matches!(
+                    j.status,
+                    AlbumDownloadStatus::Queued | AlbumDownloadStatus::Downloading { .. }
+                )
+            })
+            .count();
+        songs + albums
     }
 
     pub fn sleep_remaining_mins(&self) -> Option<u64> {
@@ -439,6 +658,14 @@ impl VibesCore {
                 (s.name.clone(), sub, parsed_artist)
             }
             Some(PlayTarget::Youtube(y)) => (y.title.clone(), y.channel.clone(), y.channel.clone()),
+            Some(PlayTarget::Local(t)) => {
+                let sub = if t.album.is_empty() {
+                    t.artist.clone()
+                } else {
+                    format!("{} · {}", t.artist, t.album)
+                };
+                (t.title.clone(), sub, t.artist.clone())
+            }
             None => ("Vibes".to_string(), "Idle · Select a station or search".to_string(), String::new()),
         };
 
@@ -473,7 +700,12 @@ impl VibesCore {
         };
         self.mpris.sync(MprisSnapshot {
             playback_status: mpris_status.to_string(),
-            title: if subtitle.is_empty() || matches!(self.current_target, Some(PlayTarget::Youtube(_))) {
+            title: if subtitle.is_empty()
+                || matches!(
+                    self.current_target,
+                    Some(PlayTarget::Youtube(_) | PlayTarget::Local(_))
+                )
+            {
                 title
             } else {
                 subtitle
@@ -482,6 +714,13 @@ impl VibesCore {
             album: match &self.current_target {
                 Some(PlayTarget::Radio(s)) => s.name.clone(),
                 Some(PlayTarget::Youtube(_)) => "YouTube Audio".to_string(),
+                Some(PlayTarget::Local(t)) => {
+                    if t.album.is_empty() {
+                        "Local Library".to_string()
+                    } else {
+                        t.album.clone()
+                    }
+                }
                 None => "Vibes".to_string(),
             },
             length_us: self.duration_secs.map(|d| (d * 1_000_000.0) as i64),
@@ -591,12 +830,31 @@ impl VibesCore {
     }
 
     pub fn queue_youtube_item(&mut self, item: YoutubeItem, cx: &mut Context<Self>) {
-        self.queue.push(item.clone());
+        if let Some(u) = youtube_thumb_url(&item.id) {
+            self.prefetch_art_url(&u, COVER_MAX_DIM);
+        }
+        self.queue.push(QueueItem::Youtube(item.clone()));
         self.show_toast(format!("Queued: {}", item.title), cx);
         if !self.playing && self.current_target.is_none() {
             self.play_next_in_queue(cx);
         }
         cx.notify();
+    }
+
+    pub fn queue_local_track(&mut self, track: LocalTrack, cx: &mut Context<Self>) {
+        self.queue.push(QueueItem::Local(track.clone()));
+        self.show_toast(format!("Queued offline: {}", track.title), cx);
+        if !self.playing && self.current_target.is_none() {
+            self.play_next_in_queue(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn play_queue_item(&mut self, item: QueueItem, cx: &mut Context<Self>) {
+        match item {
+            QueueItem::Youtube(y) => self.play_youtube(y, cx),
+            QueueItem::Local(t) => self.play_local_track(t, cx),
+        }
     }
 
     pub fn remove_queue_index(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -614,9 +872,21 @@ impl VibesCore {
     pub fn play_next_in_queue(&mut self, cx: &mut Context<Self>) {
         if !self.queue.is_empty() {
             let next = self.queue.remove(0);
-            self.play_youtube(next, cx);
+            self.play_queue_item(next, cx);
         } else {
             self.cycle_favorite(1, cx);
+        }
+    }
+
+    pub fn play_previous_action(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.current_target,
+            Some(PlayTarget::Youtube(_) | PlayTarget::Local(_))
+        ) && self.position_secs > 3.0
+        {
+            self.seek_absolute(0.0, cx);
+        } else {
+            self.cycle_favorite(-1, cx);
         }
     }
 
@@ -649,6 +919,7 @@ impl VibesCore {
         self.current_target = Some(PlayTarget::Radio(station.clone()));
         self.state.last_played = self.current_target.clone();
         self.persist_state();
+        self.prefetch_art_url(&station.favicon, ICON_MAX_DIM);
 
         self.icy_title = None;
         self.icy_name = None;
@@ -677,6 +948,12 @@ impl VibesCore {
         std::thread::spawn(move || client.register_click(&uuid));
 
         self.refresh_visualizer_state();
+        if self.lyrics_open {
+            self.refresh_lyrics_for_current(cx);
+        } else {
+            self.lyrics_track_key = None;
+            self.lyrics_state = LyricsState::Empty;
+        }
         self.sync_integrations();
         cx.notify();
     }
@@ -687,6 +964,9 @@ impl VibesCore {
         self.current_target = Some(PlayTarget::Youtube(item.clone()));
         self.state.last_played = self.current_target.clone();
         self.persist_state();
+        if let Some(u) = youtube_thumb_url(&item.id) {
+            self.prefetch_art_url(&u, COVER_MAX_DIM);
+        }
 
         self.icy_title = None;
         self.icy_name = None;
@@ -714,8 +994,92 @@ impl VibesCore {
         }
 
         self.refresh_visualizer_state();
+        if self.lyrics_open {
+            self.refresh_lyrics_for_current(cx);
+        } else {
+            self.lyrics_track_key = None;
+            self.lyrics_state = LyricsState::Empty;
+        }
         self.sync_integrations();
         cx.notify();
+    }
+
+    pub fn play_local_track(&mut self, track: LocalTrack, cx: &mut Context<Self>) {
+        if !track.path.exists() {
+            self.show_toast("File missing on disk — refreshing library", cx);
+            self.refresh_local_library(cx);
+            return;
+        }
+        self.save_current_yt_resume();
+        self.current_target = Some(PlayTarget::Local(track.clone()));
+        self.state.last_played = self.current_target.clone();
+        self.persist_state();
+
+        self.icy_title = None;
+        self.icy_name = None;
+        self.media_title = Some(track.title.clone());
+        self.position_secs = 0.0;
+        self.duration_secs = track.duration_secs;
+        self.codec = (!track.format.is_empty()).then(|| track.format.clone());
+        self.bitrate_kbps = None;
+        self.sample_rate = None;
+        self.playing = true;
+        self.paused = false;
+        self.buffering = false;
+        self.user_stopped = false;
+        self.reconnect_attempts = 0;
+
+        if let Some(ref mpv) = self.mpv {
+            let _ = mpv.set_speed(self.speed);
+            if let Err(err) = mpv.load_url(&track.path.to_string_lossy(), None) {
+                self.show_toast(format!("Local playback error: {err}"), cx);
+            }
+        }
+
+        self.refresh_visualizer_state();
+        if self.lyrics_open {
+            self.refresh_lyrics_for_current(cx);
+        } else {
+            self.lyrics_track_key = None;
+            self.lyrics_state = LyricsState::Empty;
+        }
+        self.sync_integrations();
+        cx.notify();
+    }
+
+    fn play_local_list_from(
+        &mut self,
+        tracks: &[LocalTrack],
+        start_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(first) = tracks.get(start_idx).cloned() else {
+            return;
+        };
+        self.queue = tracks[start_idx + 1..]
+            .iter()
+            .cloned()
+            .map(QueueItem::Local)
+            .collect();
+        self.play_local_track(first, cx);
+    }
+
+    pub fn play_local_album_from(
+        &mut self,
+        album: &LocalAlbum,
+        start_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.play_local_list_from(&album.tracks, start_idx, cx);
+    }
+
+    pub fn play_local_singles_from(
+        &mut self,
+        tracks: &[LocalTrack],
+        start_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.play_local_list_from(tracks, start_idx, cx);
     }
 
     pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
@@ -723,6 +1087,7 @@ impl VibesCore {
             match self.current_target.clone() {
                 Some(PlayTarget::Radio(s)) => self.play_station(s, cx),
                 Some(PlayTarget::Youtube(y)) => self.play_youtube(y, cx),
+                Some(PlayTarget::Local(t)) => self.play_local_track(t, cx),
                 None => {
                     if let Some(fav) = self.state.favorites.first().cloned() {
                         self.play_station(fav, cx);
@@ -743,7 +1108,7 @@ impl VibesCore {
         match &self.current_target {
             Some(PlayTarget::Radio(_)) => true,
             Some(PlayTarget::Youtube(y)) => y.is_live,
-            None => false,
+            Some(PlayTarget::Local(_)) | None => false,
         }
     }
 
@@ -768,7 +1133,7 @@ impl VibesCore {
                 let url = match &self.current_target {
                     Some(PlayTarget::Radio(s)) => s.stream_url().to_string(),
                     Some(PlayTarget::Youtube(y)) => y.url.clone(),
-                    None => return,
+                    Some(PlayTarget::Local(_)) | None => return,
                 };
                 self.paused = false;
                 self.buffering = true;
@@ -799,6 +1164,9 @@ impl VibesCore {
         self.paused = false;
         self.buffering = false;
         self.position_secs = 0.0;
+        self.lyrics_fetch_gen += 1;
+        self.lyrics_track_key = None;
+        self.lyrics_state = LyricsState::Empty;
         if let Some(ref mpv) = self.mpv {
             let _ = mpv.stop();
         }
@@ -811,12 +1179,16 @@ impl VibesCore {
         match self.current_target.clone() {
             Some(PlayTarget::Radio(s)) => self.play_station(s, cx),
             Some(PlayTarget::Youtube(y)) => self.play_youtube(y, cx),
+            Some(PlayTarget::Local(t)) => self.play_local_track(t, cx),
             None => {}
         }
     }
 
     pub fn seek_absolute(&mut self, secs: f64, cx: &mut Context<Self>) {
-        if !matches!(self.current_target, Some(PlayTarget::Youtube(_))) {
+        if !matches!(
+            self.current_target,
+            Some(PlayTarget::Youtube(_) | PlayTarget::Local(_))
+        ) {
             return;
         }
         let target = if let Some(dur) = self.duration_secs {
@@ -832,7 +1204,10 @@ impl VibesCore {
     }
 
     pub fn seek_relative(&mut self, delta: f64, cx: &mut Context<Self>) {
-        if !matches!(self.current_target, Some(PlayTarget::Youtube(_))) {
+        if !matches!(
+            self.current_target,
+            Some(PlayTarget::Youtube(_) | PlayTarget::Local(_))
+        ) {
             return;
         }
         self.position_secs = (self.position_secs + delta).max(0.0);
@@ -932,6 +1307,7 @@ impl VibesCore {
 
     pub fn add_favorite(&mut self, station: RadioStation, cx: &mut Context<Self>) {
         if !self.is_favorite(&station) {
+            self.prefetch_art_url(&station.favicon, ICON_MAX_DIM);
             self.state.favorites.push(station.clone());
             self.persist_state();
             self.sync_integrations();
@@ -1175,6 +1551,195 @@ impl VibesCore {
         cx.notify();
     }
 
+    pub fn toggle_lyrics_panel(&mut self, cx: &mut Context<Self>) {
+        self.lyrics_open = !self.lyrics_open;
+        if self.lyrics_open {
+            self.refresh_lyrics_for_current(cx);
+        }
+        cx.notify();
+    }
+
+    fn resolve_current_lyrics_target(&self) -> Option<(String, Option<PathBuf>, LyricsQuery)> {
+        match &self.current_target {
+            Some(PlayTarget::Local(t)) => {
+                let artist = if t.artist.eq_ignore_ascii_case("Unknown Artist") {
+                    String::new()
+                } else {
+                    t.artist.clone()
+                };
+                let query = LyricsQuery {
+                    artist,
+                    title: t.title.clone(),
+                    album: (!t.album.trim().is_empty()).then_some(t.album.clone()),
+                    duration_secs: t.duration_secs.or(self.duration_secs),
+                };
+                let key = format!("local|{}", t.path.display());
+                Some((key, Some(t.path.clone()), query))
+            }
+            Some(PlayTarget::Youtube(y)) => {
+                let ch = y
+                    .channel
+                    .strip_suffix(" - Topic")
+                    .unwrap_or(&y.channel)
+                    .trim()
+                    .to_string();
+                let (artist, title) = match parse_identifiable_track(&y.title, None) {
+                    Some(p) => (p.artist.unwrap_or(ch), p.title),
+                    None => (ch, y.title.clone()),
+                };
+                let query = LyricsQuery {
+                    artist,
+                    title,
+                    album: None,
+                    duration_secs: y.duration_secs.or(self.duration_secs),
+                };
+                let key = format!("yt|{}|{}", y.id, query.cache_key());
+                Some((key, None, query))
+            }
+            Some(PlayTarget::Radio(s)) => {
+                let text = self.current_track_text()?;
+                let parsed = parse_identifiable_track(&text, Some(&s.name))?;
+                let query = LyricsQuery {
+                    artist: parsed.artist.unwrap_or_default(),
+                    title: parsed.title,
+                    album: None,
+                    duration_secs: None,
+                };
+                let key = format!("radio|{}", query.cache_key());
+                Some((key, None, query))
+            }
+            None => None,
+        }
+    }
+
+    fn cache_lyrics_state(&mut self, key: &str, state: LyricsState) {
+        if self.lyrics_cache.len() >= 64 && !self.lyrics_cache.contains_key(key) {
+            self.lyrics_cache.clear();
+        }
+        self.lyrics_cache.insert(key.to_string(), state);
+    }
+
+    pub fn refresh_lyrics_for_current(&mut self, cx: &mut Context<Self>) {
+        self.load_lyrics_for_current(false, cx);
+    }
+
+    pub fn force_reload_lyrics(&mut self, cx: &mut Context<Self>) {
+        self.load_lyrics_for_current(true, cx);
+    }
+
+    fn load_lyrics_for_current(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some((key, local_path, query)) = self.resolve_current_lyrics_target() else {
+            self.lyrics_fetch_gen += 1;
+            self.lyrics_track_key = None;
+            self.lyrics_state = LyricsState::Empty;
+            cx.notify();
+            return;
+        };
+
+        if !force
+            && self.lyrics_track_key.as_deref() == Some(key.as_str())
+            && self.lyrics_state != LyricsState::Empty
+        {
+            return;
+        }
+
+        self.lyrics_track_key = Some(key.clone());
+        if !force && let Some(cached) = self.lyrics_cache.get(&key) {
+            self.lyrics_state = cached.clone();
+            cx.notify();
+            return;
+        }
+
+        self.lyrics_fetch_gen += 1;
+        let gen_id = self.lyrics_fetch_gen;
+        self.lyrics_state = LyricsState::Loading;
+        cx.notify();
+
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let state = if let Some(ref path) = local_path
+                && let Some(raw) = read_embedded_lyrics(path)
+                && let Some(doc) = parse_lyrics_text(&raw, LyricsOrigin::Embedded)
+            {
+                LyricsState::Ready(doc)
+            } else if !query.title.trim().is_empty() {
+                let res = fetch_lrclib_lyrics(&new_http_agent(), &query);
+                match lrclib_to_document(res) {
+                    Some(doc) => LyricsState::Ready(doc),
+                    None => LyricsState::NotFound,
+                }
+            } else {
+                LyricsState::NotFound
+            };
+            let _ = tx.send_blocking(CoreBgEvent::LyricsLoaded { gen_id, key, state });
+        });
+    }
+
+    pub fn embed_current_lyrics_to_file(&mut self, cx: &mut Context<Self>) {
+        let (path, name, raw_lyrics) = match (&self.current_target, &self.lyrics_state) {
+            (Some(PlayTarget::Local(t)), LyricsState::Ready(doc))
+                if doc.origin == LyricsOrigin::Lrclib && doc.kind != LyricsKind::Instrumental =>
+            {
+                let name = t
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&t.title)
+                    .to_string();
+                (t.path.clone(), name, doc.raw.clone())
+            }
+            _ => return,
+        };
+
+        match embed_lyrics_in_file(&path, &raw_lyrics) {
+            Ok(()) => {
+                if let LyricsState::Ready(ref mut doc) = self.lyrics_state {
+                    doc.origin = LyricsOrigin::Embedded;
+                }
+                if let Some(key) = self.lyrics_track_key.clone() {
+                    let st = self.lyrics_state.clone();
+                    self.cache_lyrics_state(&key, st);
+                }
+                self.show_toast(format!("Embedded lyrics into {name}"), cx);
+                cx.notify();
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to embed lyrics: {err}"), cx);
+            }
+        }
+    }
+
+    pub fn start_lyrics_backfill(&mut self, cx: &mut Context<Self>) {
+        if self.lyrics_backfill.active {
+            return;
+        }
+        let mut roots = vec![self.config.albums_dir.clone()];
+        if self.config.music_dir != self.config.albums_dir {
+            roots.push(self.config.music_dir.clone());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.lyrics_backfill_cancel = Some(Arc::clone(&cancel));
+        self.lyrics_backfill = LyricsBackfillProgress {
+            active: true,
+            ..Default::default()
+        };
+        cx.notify();
+
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            run_library_lyrics_backfill(roots, cancel, |prog| {
+                let _ = tx.send_blocking(CoreBgEvent::LyricsBackfillUpdated(prog));
+            });
+        });
+    }
+
+    pub fn cancel_lyrics_backfill(&mut self, cx: &mut Context<Self>) {
+        if let Some(ref cancel) = self.lyrics_backfill_cancel {
+            cancel.store(true, Ordering::Release);
+            self.show_toast("Cancelling lyrics backfill…", cx);
+        }
+    }
+
     pub fn toggle_close_to_tray(&mut self, cx: &mut Context<Self>) {
         self.config.close_to_tray = !self.config.close_to_tray;
         self.persist_config();
@@ -1184,7 +1749,7 @@ impl VibesCore {
     pub fn set_music_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.config.music_dir = dir;
         self.persist_config();
-        cx.notify();
+        self.refresh_local_library(cx);
     }
 
     pub fn set_save_folder_mode(&mut self, mode: SaveFolderMode, cx: &mut Context<Self>) {
@@ -1200,8 +1765,278 @@ impl VibesCore {
     }
 
     pub fn open_music_folder(&self) {
-        let _ = std::fs::create_dir_all(&self.config.music_dir);
-        let _ = Command::new("xdg-open").arg(&self.config.music_dir).spawn();
+        self.open_folder(&self.config.music_dir);
+    }
+
+    pub fn open_folder(&self, path: &std::path::Path) {
+        let _ = std::fs::create_dir_all(path);
+        let _ = Command::new("xdg-open").arg(path).spawn();
+    }
+
+    pub fn set_albums_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.config.albums_dir = dir;
+        self.persist_config();
+        self.refresh_local_library(cx);
+    }
+
+    pub fn set_album_folder_mode(&mut self, mode: AlbumFolderMode, cx: &mut Context<Self>) {
+        self.config.album_folder_mode = mode;
+        self.persist_config();
+        cx.notify();
+    }
+
+    // ---- Local Offline Library ----
+
+    pub fn refresh_local_library(&mut self, cx: &mut Context<Self>) {
+        self.local_scan_gen = self.local_scan_gen.wrapping_add(1);
+        let gen_id = self.local_scan_gen;
+        self.local_library_loading = true;
+        let albums_dir = self.config.albums_dir.clone();
+        let music_dir = self.config.music_dir.clone();
+        let tx = self.bg_tx.clone();
+
+        std::thread::spawn(move || {
+            let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scan_local_library(&albums_dir, &music_dir)
+            }))
+            .unwrap_or_default();
+            let _ = tx.send_blocking(CoreBgEvent::LocalLibraryScanned { gen_id, snapshot });
+            trim_allocator();
+        });
+        cx.notify();
+    }
+
+    pub fn set_local_filter_query(&mut self, q: String, cx: &mut Context<Self>) {
+        if self.local_filter_query != q {
+            self.local_filter_query = q;
+            cx.notify();
+        }
+    }
+
+    pub fn set_local_tab_singles(&mut self, singles: bool, cx: &mut Context<Self>) {
+        if self.local_tab_singles != singles {
+            self.local_tab_singles = singles;
+            cx.notify();
+        }
+    }
+
+    pub fn select_local_album(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.selected_local_album = folder;
+        cx.notify();
+    }
+
+    // ---- Official Album Search, Playback & Full Download ----
+
+    pub fn search_albums_query(&mut self, query: String, cx: &mut Context<Self>) {
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.album_query = q.clone();
+        self.selected_album = None;
+        self.album_loading = true;
+        self.album_error = None;
+        self.album_fetch_gen = self.album_fetch_gen.wrapping_add(1);
+        let gen_id = self.album_fetch_gen;
+        let tx = self.bg_tx.clone();
+
+        std::thread::spawn(move || {
+            let res = search_albums(&q).map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::AlbumsSearched { gen_id, res });
+        });
+        cx.notify();
+    }
+
+    fn load_album_details(&mut self, summary: AlbumSummary, auto_download: bool, cx: &mut Context<Self>) {
+        if !auto_download {
+            self.album_detail_loading = true;
+            self.album_error = None;
+        } else {
+            self.show_toast(format!("Fetching tracklist for {}…", summary.title), cx);
+        }
+        self.album_detail_gen = self.album_detail_gen.wrapping_add(1);
+        let gen_id = self.album_detail_gen;
+        let tx = self.bg_tx.clone();
+
+        std::thread::spawn(move || {
+            let res = fetch_album_details(&summary).map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::AlbumDetailsLoaded {
+                gen_id,
+                auto_download,
+                res,
+            });
+        });
+        cx.notify();
+    }
+
+    pub fn select_album(&mut self, summary: AlbumSummary, cx: &mut Context<Self>) {
+        self.load_album_details(summary, false, cx);
+    }
+
+    pub fn quick_download_album(&mut self, summary: AlbumSummary, cx: &mut Context<Self>) {
+        self.load_album_details(summary, true, cx);
+    }
+
+    pub fn clear_selected_album(&mut self, cx: &mut Context<Self>) {
+        self.selected_album = None;
+        self.album_detail_loading = false;
+        cx.notify();
+    }
+
+    fn track_to_yt_item(track: &AlbumTrack) -> YoutubeItem {
+        YoutubeItem {
+            id: track.video_id.clone(),
+            title: track.title.clone(),
+            channel: track.artist.clone(),
+            duration_secs: track.duration_secs,
+            url: track.url.clone(),
+            is_live: false,
+            view_count: None,
+        }
+    }
+
+    pub fn play_album_from_track(
+        &mut self,
+        details: &AlbumDetails,
+        start_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if start_idx >= details.tracks.len() {
+            return;
+        }
+
+        let local_dir = find_local_album_dir(
+            &self.config.albums_dir,
+            &details.summary.artist,
+            &details.summary.title,
+        );
+        let album_cover = local_dir
+            .as_deref()
+            .and_then(|d| resolve_local_album_art(d, &[]))
+            .or_else(|| {
+                details
+                    .cover_url
+                    .as_deref()
+                    .or(details.summary.cover_url.as_deref())
+                    .and_then(|u| self.art_path_for_url(u).cloned())
+            });
+
+        let resolve_item = |tr: &AlbumTrack| -> QueueItem {
+            if let Some(path) = local_dir
+                .as_deref()
+                .and_then(|d| find_local_track_in_dir(d, tr.track_number, &tr.title))
+            {
+                let ext_upper = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default()
+                    .to_uppercase();
+                let track_cover = album_cover.clone().or_else(|| {
+                    path.parent()
+                        .and_then(|d| resolve_local_album_art(d, &[path.clone()]))
+                });
+                return QueueItem::Local(LocalTrack {
+                    path,
+                    title: tr.title.clone(),
+                    artist: tr.artist.clone(),
+                    album: details.summary.title.clone(),
+                    track_number: Some(tr.track_number),
+                    duration_secs: tr.duration_secs,
+                    format: ext_upper,
+                    cover_path: track_cover,
+                });
+            }
+            if let Some(u) = youtube_thumb_url(&tr.video_id) {
+                self.prefetch_art_url(&u, COVER_MAX_DIM);
+            }
+            QueueItem::Youtube(Self::track_to_yt_item(tr))
+        };
+
+        let mut items: Vec<QueueItem> = details.tracks[start_idx..]
+            .iter()
+            .map(resolve_item)
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let all_local = items.iter().all(QueueItem::is_local);
+        let first = items.remove(0);
+        let first_local = first.is_local();
+        self.queue = items;
+        self.play_queue_item(first, cx);
+        if first_local {
+            self.show_toast(
+                if all_local {
+                    "Playing locally from disk (offline)"
+                } else {
+                    "Playing track locally from disk"
+                },
+                cx,
+            );
+        }
+    }
+
+    pub fn enqueue_album_download(&mut self, details: AlbumDetails, cx: &mut Context<Self>) {
+        if details.tracks.is_empty() {
+            self.show_toast("Album has no downloadable tracks", cx);
+            return;
+        }
+        if self.album_downloads.iter().any(|j| {
+            j.title.eq_ignore_ascii_case(&details.summary.title)
+                && j.artist.eq_ignore_ascii_case(&details.summary.artist)
+                && matches!(
+                    j.status,
+                    AlbumDownloadStatus::Queued | AlbumDownloadStatus::Downloading { .. }
+                )
+        }) {
+            self.show_toast(format!("Already downloading {}", details.summary.title), cx);
+            return;
+        }
+
+        let job_id = self.next_job_id;
+        self.next_job_id += 1;
+        let folder = resolve_album_dir(
+            &self.config.albums_dir,
+            self.config.album_folder_mode,
+            &details.summary.artist,
+            &details.summary.title,
+        );
+        let total = details.tracks.len();
+        let title = details.summary.title.clone();
+        self.album_downloads.insert(
+            0,
+            AlbumDownloadJob {
+                id: job_id,
+                title: title.clone(),
+                artist: details.summary.artist.clone(),
+                year: details.summary.year,
+                folder: folder.clone(),
+                status: AlbumDownloadStatus::Queued,
+                created_at: Local::now().format("%H:%M:%S").to_string(),
+                details: details.clone(),
+            },
+        );
+        self.show_toast(format!("Downloading album: {title} ({total} tracks)…"), cx);
+        self.sync_integrations();
+
+        let albums_dir = self.config.albums_dir.clone();
+        let mode = self.config.album_folder_mode;
+        let format = self.config.save_audio_format;
+        let tx = self.bg_tx.clone();
+
+        std::thread::spawn(move || {
+            run_download_album(&albums_dir, mode, format, &details, |status| {
+                let _ = tx.send_blocking(CoreBgEvent::AlbumDownloadProgress { job_id, status });
+            });
+        });
+        cx.notify();
+    }
+
+    pub fn retry_album_download(&mut self, job_id: u64, cx: &mut Context<Self>) {
+        let Some(job) = self.album_downloads.iter().find(|j| j.id == job_id).cloned() else {
+            return;
+        };
+        self.enqueue_album_download(job.details, cx);
     }
 
     // ---- Internal Event Handlers ----
@@ -1266,6 +2101,10 @@ impl VibesCore {
                 self.media_title = Some(title.clone());
                 if changed {
                     self.record_song_log(&title);
+                    if self.lyrics_open && matches!(self.current_target, Some(PlayTarget::Radio(_)))
+                    {
+                        self.refresh_lyrics_for_current(cx);
+                    }
                     sync_dbus = true;
                     dirty_ui = true;
                 }
@@ -1276,6 +2115,9 @@ impl VibesCore {
                     self.icy_title = Some(t.clone());
                     if changed {
                         self.record_song_log(&t);
+                        if self.lyrics_open {
+                            self.refresh_lyrics_for_current(cx);
+                        }
                         sync_dbus = true;
                         dirty_ui = true;
                     }
@@ -1286,9 +2128,17 @@ impl VibesCore {
                 }
             }
             MpvEvent::TimePosChanged(pos) => {
-                let prev_whole = self.position_secs as u64;
+                let prev_pos = self.position_secs;
+                let prev_whole = prev_pos as u64;
                 self.position_secs = pos;
                 if (pos as u64) != prev_whole {
+                    dirty_ui = true;
+                } else if self.lyrics_open
+                    && let LyricsState::Ready(ref doc) = self.lyrics_state
+                    && let LyricsKind::Synced(ref lines) = doc.kind
+                    && active_synced_line_index(lines, prev_pos)
+                        != active_synced_line_index(lines, pos)
+                {
                     dirty_ui = true;
                 }
             }
@@ -1340,8 +2190,12 @@ impl VibesCore {
                     && !self.paused
                 {
                     match self.current_target.clone() {
-                        Some(PlayTarget::Youtube(yt)) if reason == "eof" => {
-                            if !yt.id.is_empty() {
+                        Some(PlayTarget::Youtube(_)) | Some(PlayTarget::Local(_))
+                            if reason == "eof" =>
+                        {
+                            if let Some(PlayTarget::Youtube(ref yt)) = self.current_target
+                                && !yt.id.is_empty()
+                            {
                                 self.state.resume_positions.remove(&yt.id);
                                 self.persist_state();
                             }
@@ -1439,7 +2293,7 @@ impl VibesCore {
             MprisAction::PlayPause => self.toggle_play(cx),
             MprisAction::Stop => self.stop_playback(cx),
             MprisAction::Next => self.play_next_in_queue(cx),
-            MprisAction::Previous => self.cycle_favorite(-1, cx),
+            MprisAction::Previous => self.play_previous_action(cx),
             MprisAction::SeekMicros(us) => self.seek_relative((us as f64) / 1_000_000.0, cx),
             MprisAction::Raise => {
                 let _ = self.window_tx.try_send(WindowCmd::Show);
@@ -1472,6 +2326,7 @@ impl VibesCore {
                         } else {
                             self.stations = fetched;
                         }
+                        self.prefetch_stations_art(&self.stations);
                     }
                     Err(err) => {
                         self.radio_error = Some(err);
@@ -1493,6 +2348,11 @@ impl VibesCore {
                 match res {
                     Ok(items) => {
                         self.yt_error = None;
+                        for it in &items {
+                            if let Some(u) = youtube_thumb_url(&it.id) {
+                                self.prefetch_art_url(&u, COVER_MAX_DIM);
+                            }
+                        }
                         self.yt_results = items;
                         self.state.recent_yt_searches.retain(|q| !q.eq_ignore_ascii_case(&query));
                         self.state.recent_yt_searches.insert(0, query);
@@ -1503,6 +2363,127 @@ impl VibesCore {
                         self.yt_error = Some(err);
                     }
                 }
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::AlbumsSearched { gen_id, res } => {
+                if gen_id != self.album_fetch_gen {
+                    return;
+                }
+                self.album_loading = false;
+                match res {
+                    Ok(list) => {
+                        self.album_error = None;
+                        for summary in &list {
+                            if let Some(ref url) = summary.cover_url {
+                                self.prefetch_art_url(url, COVER_MAX_DIM);
+                            }
+                        }
+                        self.album_results = list;
+                    }
+                    Err(err) => {
+                        self.album_error = Some(err);
+                    }
+                }
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::AlbumDetailsLoaded {
+                gen_id,
+                auto_download,
+                res,
+            } => {
+                if !auto_download && gen_id != self.album_detail_gen {
+                    return;
+                }
+                self.album_detail_loading = false;
+                match res {
+                    Ok(details) => {
+                        self.album_error = None;
+                        if let Some(ref url) = details.cover_url {
+                            self.prefetch_art_url(url, COVER_MAX_DIM);
+                        }
+                        if let Some(ref url) = details.summary.cover_url {
+                            self.prefetch_art_url(url, COVER_MAX_DIM);
+                        }
+                        if auto_download {
+                            self.enqueue_album_download(details, cx);
+                        } else {
+                            self.selected_album = Some(details);
+                        }
+                    }
+                    Err(err) => {
+                        self.album_error = Some(err.clone());
+                        self.show_toast(format!("Album error: {err}"), cx);
+                    }
+                }
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::AlbumDownloadProgress { job_id, status } => {
+                let title = self
+                    .album_downloads
+                    .iter()
+                    .find(|j| j.id == job_id)
+                    .map(|j| j.title.clone())
+                    .unwrap_or_default();
+                if let Some(job) = self.album_downloads.iter_mut().find(|j| j.id == job_id) {
+                    job.status = status.clone();
+                }
+                match status {
+                    AlbumDownloadStatus::Completed {
+                        saved,
+                        skipped,
+                        failed,
+                        ..
+                    } => {
+                        self.show_toast(
+                            format!("Album '{title}' ready: {saved} saved, {skipped} skipped, {failed} failed"),
+                            cx,
+                        );
+                        self.refresh_local_library(cx);
+                    }
+                    AlbumDownloadStatus::Failed(ref err) => {
+                        self.show_toast(format!("Album '{title}' failed: {err}"), cx);
+                    }
+                    AlbumDownloadStatus::Queued | AlbumDownloadStatus::Downloading { .. } => {}
+                }
+                self.sync_integrations();
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::LocalLibraryScanned { gen_id, snapshot } => {
+                if gen_id != self.local_scan_gen {
+                    return;
+                }
+                self.local_library_loading = false;
+                if let Some(ref sel) = self.selected_local_album
+                    && !snapshot.albums.iter().any(|a| &a.folder == sel)
+                {
+                    self.selected_local_album = None;
+                }
+                if let Some(PlayTarget::Local(ref mut cur)) = self.current_target
+                    && cur.cover_path.is_none()
+                {
+                    cur.cover_path = snapshot
+                        .albums
+                        .iter()
+                        .flat_map(|a| a.tracks.iter())
+                        .chain(snapshot.singles.iter())
+                        .find(|t| t.path == cur.path)
+                        .and_then(|t| t.cover_path.clone());
+                }
+                self.local_library = snapshot;
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::ArtworkLoaded { key, path } => {
+                self.art_cache.insert(key, path);
                 if self.window_open {
                     cx.notify();
                 }
@@ -1524,6 +2505,7 @@ impl VibesCore {
                             .and_then(|n| n.to_str())
                             .unwrap_or(&label);
                         self.show_toast(format!("Saved: {name}"), cx);
+                        self.refresh_local_library(cx);
                     }
                     DownloadStatus::AlreadyExists(ref p) => {
                         let name = p
@@ -1542,17 +2524,54 @@ impl VibesCore {
                     cx.notify();
                 }
             }
+            CoreBgEvent::LyricsLoaded { gen_id, key, state } => {
+                self.cache_lyrics_state(&key, state.clone());
+                if gen_id == self.lyrics_fetch_gen
+                    && self.lyrics_track_key.as_deref() == Some(key.as_str())
+                {
+                    self.lyrics_state = state;
+                    if self.window_open {
+                        cx.notify();
+                    }
+                }
+            }
+            CoreBgEvent::LyricsBackfillUpdated(prog) => {
+                let finished = self.lyrics_backfill.active && !prog.active;
+                self.lyrics_backfill = prog.clone();
+                if finished {
+                    self.lyrics_backfill_cancel = None;
+                    self.show_toast(
+                        format!(
+                            "Lyrics backfill: {} embedded, {} already tagged, {} not found",
+                            prog.embedded, prog.skipped_existing, prog.not_found
+                        ),
+                        cx,
+                    );
+                    if prog.embedded > 0
+                        && self.lyrics_open
+                        && matches!(self.current_target, Some(PlayTarget::Local(_)))
+                    {
+                        self.force_reload_lyrics(cx);
+                    }
+                }
+                if self.window_open {
+                    cx.notify();
+                }
+            }
         }
     }
 
     pub fn shutdown(&mut self, cx: &mut App) {
+        if let Some(ref cancel) = self.lyrics_backfill_cancel {
+            cancel.store(true, Ordering::Release);
+        }
         self.save_current_yt_resume();
         self.persist_config();
         self.persist_state();
-        self.visualizer.stop();
         if let Some(ref mpv) = self.mpv {
             mpv.shutdown();
         }
+        self.visualizer.stop();
         self.tray.shutdown();
         self._instance_guard = None;
         cx.quit();

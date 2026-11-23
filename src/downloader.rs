@@ -310,6 +310,8 @@ pub struct YtInfoMetadata {
     #[serde(default)]
     pub categories: Option<Vec<String>>,
     #[serde(default)]
+    pub duration: Option<f64>,
+    #[serde(default)]
     pub webpage_url: Option<String>,
 }
 
@@ -387,14 +389,28 @@ pub fn crop_thumbnail_to_square_jpg(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Embeds complete artist/album/date/genre/source metadata and front cover art using `lofty`.
-pub fn apply_rich_metadata_and_cover(
+#[derive(Debug, Clone, Default)]
+pub struct TrackTagSpec {
+    pub title: String,
+    pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub album: Option<String>,
+    pub track_number: Option<u32>,
+    pub track_total: Option<u32>,
+    pub date: Option<Timestamp>,
+    pub genre: Option<String>,
+    pub publisher: Option<String>,
+    pub source_url: Option<String>,
+    pub radio_station: Option<String>,
+    pub comment: String,
+    pub lyrics: Option<String>,
+}
+
+/// Writes structured tags and front cover JPEG onto any `lofty`-supported audio file.
+pub fn write_tags_and_cover(
     audio_path: &Path,
-    info: Option<&YtInfoMetadata>,
+    spec: &TrackTagSpec,
     cover_jpg: Option<&[u8]>,
-    parsed: &ParsedTrack,
-    radio_station: Option<&str>,
-    fallback_url: &str,
 ) -> Result<()> {
     let mut tagged_file = Probe::open(audio_path)
         .with_context(|| format!("Failed to open {}", audio_path.display()))?
@@ -409,6 +425,132 @@ pub fn apply_rich_metadata_and_cover(
         .primary_tag_mut()
         .context("No writable metadata tag available")?;
 
+    tag.set_title(spec.title.clone());
+    if let Some(ref a) = spec.artist {
+        tag.set_artist(a.clone());
+    }
+    if let Some(ref aa) = spec.album_artist {
+        tag.insert_text(ItemKey::AlbumArtist, aa.clone());
+    }
+    if let Some(ref alb) = spec.album {
+        tag.set_album(alb.clone());
+    }
+    if let Some(trk) = spec.track_number {
+        tag.set_track(trk);
+    }
+    if let Some(tot) = spec.track_total {
+        tag.set_track_total(tot);
+    }
+    if let Some(ts) = spec.date {
+        tag.set_date(ts);
+    }
+    if let Some(ref g) = spec.genre {
+        tag.set_genre(g.clone());
+    }
+    if let Some(ref pub_name) = spec.publisher {
+        tag.insert_text(ItemKey::Publisher, pub_name.clone());
+    }
+    if let Some(ref url) = spec.source_url
+        && !url.is_empty()
+    {
+        tag.insert_text(ItemKey::Description, url.clone());
+        tag.insert_text(ItemKey::AudioSourceUrl, url.clone());
+    }
+    if let Some(ref st) = spec.radio_station {
+        tag.insert_text(ItemKey::InternetRadioStationName, st.clone());
+    }
+    if !spec.comment.is_empty() {
+        tag.set_comment(spec.comment.clone());
+    }
+    if let Some(ref lyr) = spec.lyrics
+        && !lyr.trim().is_empty()
+    {
+        crate::lyrics::set_lyrics_on_tag(tag, lyr);
+    }
+
+    if let Some(jpg) = cover_jpg.filter(|b| !b.is_empty()) {
+        tag.remove_picture_type(PictureType::CoverFront);
+        let pic = Picture::unchecked(jpg.to_vec())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(MimeType::Jpeg)
+            .description("Cover")
+            .build();
+        tag.push_picture(pic);
+    }
+
+    tag.save_to_path(audio_path, WriteOptions::default())
+        .with_context(|| format!("Failed to save metadata to {}", audio_path.display()))?;
+    Ok(())
+}
+
+/// Runs `yt-dlp` to extract clean audio in `format` into `dest_dir/<clean_name>.<ext>`.
+pub fn extract_ytdlp_audio(
+    url: &str,
+    dest_dir: &Path,
+    clean_name: &str,
+    format: SaveAudioFormat,
+    write_sidecars: bool,
+) -> Result<PathBuf> {
+    let final_path = dest_dir.join(format!("{clean_name}.{}", format.extension()));
+    let template = format!("{}.%(ext)s", dest_dir.join(clean_name).to_string_lossy());
+
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--no-playlist", "--no-warnings"]);
+    if format == SaveAudioFormat::Opus {
+        cmd.args(["-f", "bestaudio[acodec^=opus]/bestaudio/best"]);
+    }
+    cmd.args([
+        "-x",
+        "--audio-format",
+        format.ytdlp_format(),
+        "--audio-quality",
+        "0",
+        "--embed-metadata",
+        "--no-embed-chapters",
+        "--no-embed-info-json",
+    ]);
+    if write_sidecars {
+        cmd.args(["--write-thumbnail", "--write-info-json"]);
+    }
+    cmd.args(["-o", &template, url]);
+
+    let out = cmd.output().context("Failed to launch yt-dlp")?;
+    if !out.status.success() {
+        let err_txt = String::from_utf8_lossy(&out.stderr);
+        let msg = err_txt.lines().last().unwrap_or("yt-dlp download failed");
+        anyhow::bail!("{}", msg.trim());
+    }
+
+    if final_path.exists() {
+        return Ok(final_path);
+    }
+    let ext_want = format.extension();
+    let found = fs::read_dir(dest_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem == clean_name)
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext_want))
+        });
+    Ok(found.unwrap_or(final_path))
+}
+
+/// Embeds complete artist/album/date/genre/source metadata and front cover art using `lofty`.
+pub fn apply_rich_metadata_and_cover(
+    audio_path: &Path,
+    info: Option<&YtInfoMetadata>,
+    cover_jpg: Option<&[u8]>,
+    parsed: &ParsedTrack,
+    radio_station: Option<&str>,
+    fallback_url: &str,
+) -> Result<()> {
     let non_empty = |opt: Option<&String>| -> Option<String> {
         opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     };
@@ -478,47 +620,40 @@ pub fn apply_rich_metadata_and_cover(
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| fallback_url.to_string());
 
-    tag.set_title(title);
-    if let Some(ref a) = artist {
-        tag.set_artist(a.clone());
-        tag.insert_text(ItemKey::AlbumArtist, a.clone());
-    }
-    if let Some(alb) = album {
-        tag.set_album(alb);
-    }
-    if let Some(ts) = date {
-        tag.set_date(ts);
-    }
-    if let Some(g) = genre {
-        tag.set_genre(g);
-    }
-    if let Some(ref ch) = channel_fallback {
-        tag.insert_text(ItemKey::Publisher, ch.clone());
-    }
-    if !source_url.is_empty() {
-        tag.insert_text(ItemKey::Description, source_url.clone());
-        tag.insert_text(ItemKey::AudioSourceUrl, source_url);
-    }
-    if let Some(st) = station_clean {
-        tag.insert_text(ItemKey::InternetRadioStationName, st.to_string());
-        tag.set_comment(format!("Saved via Vibes · Station: {st}"));
-    } else {
-        tag.set_comment("Saved via Vibes".to_string());
-    }
+    let comment = match station_clean {
+        Some(st) => format!("Saved via Vibes · Station: {st}"),
+        None => "Saved via Vibes".to_string(),
+    };
 
-    if let Some(jpg) = cover_jpg.filter(|b| !b.is_empty()) {
-        tag.remove_picture_type(PictureType::CoverFront);
-        let pic = Picture::unchecked(jpg.to_vec())
-            .pic_type(PictureType::CoverFront)
-            .mime_type(MimeType::Jpeg)
-            .description("Cover")
-            .build();
-        tag.push_picture(pic);
-    }
+    let lyrics = artist.as_ref().and_then(|art| {
+        let query = crate::lyrics::LyricsQuery {
+            artist: art.clone(),
+            title: title.clone(),
+            album: album.clone(),
+            duration_secs: info.and_then(|i| i.duration),
+        };
+        let agent = crate::lyrics::new_http_agent();
+        let res = crate::lyrics::fetch_lrclib_lyrics(&agent, &query);
+        crate::lyrics::lrclib_text_to_embed(&res).map(str::to_string)
+    });
 
-    tag.save_to_path(audio_path, WriteOptions::default())
-        .with_context(|| format!("Failed to save metadata to {}", audio_path.display()))?;
-    Ok(())
+    let spec = TrackTagSpec {
+        title,
+        album_artist: artist.clone(),
+        artist,
+        album,
+        track_number: None,
+        track_total: None,
+        date,
+        genre,
+        publisher: channel_fallback,
+        source_url: (!source_url.is_empty()).then_some(source_url),
+        radio_station: station_clean.map(|s| s.to_string()),
+        comment,
+        lyrics,
+    };
+
+    write_tags_and_cover(audio_path, &spec, cover_jpg)
 }
 
 fn find_and_clean_sidecars(
@@ -627,52 +762,8 @@ pub fn run_save_song(
     };
 
     on_progress(DownloadStatus::Downloading(parsed.display.clone()));
-    let template = format!("{}.%(ext)s", dest_dir.join(&clean_name).to_string_lossy());
-    let mut cmd = Command::new("yt-dlp");
-    cmd.args(["--no-playlist", "--no-warnings"]);
-    if format == SaveAudioFormat::Opus {
-        cmd.args(["-f", "bestaudio[acodec^=opus]/bestaudio/best"]);
-    }
-    cmd.args([
-        "-x",
-        "--audio-format",
-        format.ytdlp_format(),
-        "--audio-quality",
-        "0",
-        "--embed-metadata",
-        "--write-thumbnail",
-        "--write-info-json",
-        "--no-embed-chapters",
-        "--no-embed-info-json",
-        "-o",
-        &template,
-        &chosen_url,
-    ]);
-    let dl = cmd.output();
-
-    let status = match dl {
-        Ok(out) if out.status.success() => {
-            let actual_path = if final_path.exists() {
-                final_path
-            } else {
-                let ext_want = format.extension();
-                let found = fs::read_dir(&dest_dir)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .map(|e| e.path())
-                    .find(|p| {
-                        p.file_stem()
-                            .and_then(|s| s.to_str())
-                            .is_some_and(|stem| stem == clean_name)
-                            && p.extension()
-                                .and_then(|e| e.to_str())
-                                .is_some_and(|e| e.eq_ignore_ascii_case(ext_want))
-                    });
-                found.unwrap_or(final_path)
-            };
-
+    let status = match extract_ytdlp_audio(&chosen_url, &dest_dir, &clean_name, format, true) {
+        Ok(actual_path) => {
             let (info, cover_jpg) = find_and_clean_sidecars(&dest_dir, &clean_name);
             let radio_name = is_from_radio.then_some(source_station);
             if let Err(err) = apply_rich_metadata_and_cover(
@@ -687,13 +778,10 @@ pub fn run_save_song(
             }
             DownloadStatus::Saved(actual_path)
         }
-        Ok(out) => {
+        Err(err) => {
             let _ = find_and_clean_sidecars(&dest_dir, &clean_name);
-            let err_txt = String::from_utf8_lossy(&out.stderr);
-            let msg = err_txt.lines().last().unwrap_or("yt-dlp download failed");
-            DownloadStatus::Failed(msg.trim().to_string())
+            DownloadStatus::Failed(format!("{err}"))
         }
-        Err(err) => DownloadStatus::Failed(format!("Failed to launch yt-dlp: {err}")),
     };
     on_progress(status.clone());
     status
@@ -868,5 +956,15 @@ mod tests {
                     && p.mime_type() == Some(&MimeType::Jpeg)
                     && !p.data().is_empty())
         );
+
+        let lrc = "[00:01.00] Line one\n[00:02.00] Line two";
+        let lyric_spec = TrackTagSpec {
+            title: "Turbo Killer".into(),
+            artist: Some("Carpenter Brut".into()),
+            lyrics: Some(lrc.to_string()),
+            ..Default::default()
+        };
+        write_tags_and_cover(&opus_path, &lyric_spec, Some(&cover_bytes)).unwrap();
+        assert_eq!(crate::lyrics::read_embedded_lyrics(&opus_path).as_deref(), Some(lrc));
     }
 }

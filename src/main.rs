@@ -1,7 +1,11 @@
+mod albums;
+mod artwork;
 mod config;
 mod core;
 mod downloader;
 mod instance;
+mod local_library;
+mod lyrics;
 mod mpris;
 mod mpv;
 mod radio;

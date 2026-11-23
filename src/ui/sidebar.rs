@@ -1,4 +1,4 @@
-use super::VibesWindow;
+use super::{VibesWindow, art};
 use crate::core::{NavSection, VibesCore};
 use crate::theme::hsla;
 use gpui_kit::assets::IconName;
@@ -13,18 +13,26 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
     let core = win.core.read(cx);
     let pal = core.palette.clone();
     let active_sec = core.section;
+    let local_album_count = core.local_library.albums.len();
     let fav_count = core.state.favorites.len();
     let log_count = core.state.song_log.len();
     let queue_count = core.queue.len();
     let active_dl = core.active_saving_count();
-    let dl_total = core.downloads.len();
-    let presets: Vec<(usize, String, crate::radio::RadioStation)> = core
+    let dl_total = core.downloads.len() + core.album_downloads.len();
+    let presets: Vec<(usize, String, crate::radio::RadioStation, Option<std::path::PathBuf>)> = core
         .state
         .favorites
         .iter()
         .take(6)
         .enumerate()
-        .map(|(i, s)| (i + 1, s.name.clone(), s.clone()))
+        .map(|(i, s)| {
+            (
+                i + 1,
+                s.name.clone(),
+                s.clone(),
+                core.art_path_for_url(&s.favicon).cloned(),
+            )
+        })
         .collect();
     let current_stream = match &core.current_target {
         Some(crate::config::PlayTarget::Radio(s)) => Some(s.stream_url().to_lowercase()),
@@ -34,6 +42,13 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
     let nav_items: Vec<(NavSection, IconName, &str, Option<String>)> = vec![
         (NavSection::Radio, IconName::Radio, "Radio", None),
         (NavSection::Youtube, IconName::Headphones, "YouTube Audio", None),
+        (NavSection::Albums, IconName::Disc3, "Albums", None),
+        (
+            NavSection::Library,
+            IconName::Music,
+            "Local Library",
+            (local_album_count > 0).then(|| local_album_count.to_string()),
+        ),
         (
             NavSection::Favorites,
             IconName::Star,
@@ -160,7 +175,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
                     .min_h_0()
                     .gap_0p5()
                     .overflow_y_scrollbar()
-                    .children(presets.into_iter().map(|(slot, name, station)| {
+                    .children(presets.into_iter().map(|(slot, name, station, fav_art)| {
                         let is_playing_preset = current_stream
                             .as_deref()
                             .is_some_and(|u| u == station.stream_url().to_lowercase());
@@ -168,7 +183,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
                         div()
                             .id(SharedString::from(format!("preset-{slot}")))
                             .w_full()
-                            .h(px(28.))
+                            .h(px(30.))
                             .px_2()
                             .rounded(px(5.))
                             .cursor_pointer()
@@ -181,11 +196,20 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
                                 h_flex()
                                     .size_full()
                                     .items_center()
-                                    .gap_2()
+                                    .gap_1p5()
+                                    .child(art::render_art_tile(
+                                        fav_art.as_ref(),
+                                        20.,
+                                        4.,
+                                        IconName::Radio,
+                                        &name,
+                                        is_playing_preset,
+                                        &pal,
+                                    ))
                                     .child(
                                         div()
-                                            .w(px(16.))
-                                            .h(px(16.))
+                                            .w(px(15.))
+                                            .h(px(15.))
                                             .rounded(px(4.))
                                             .bg(hsla(if is_playing_preset {
                                                 pal.accent

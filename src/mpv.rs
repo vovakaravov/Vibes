@@ -335,6 +335,14 @@ impl MpvController {
         }))
     }
 
+    pub fn set_audio_filter_label(&self, spec: &str) -> Result<()> {
+        self.send_cmd(json!({ "command": ["af", "add", spec] }))
+    }
+
+    pub fn remove_audio_filter_label(&self, label: &str) -> Result<()> {
+        self.send_cmd(json!({ "command": ["af", "remove", label] }))
+    }
+
     pub fn shutdown(&self) {
         let _ = self.send_cmd(json!({ "command": ["quit"] }));
         *self.writer.lock().unwrap() = None;
