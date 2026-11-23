@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemePreset {
     #[default]
+    VibesCrimson,
     PlasmaNative,
     KanagawaDragon,
     BreezeDark,
@@ -15,7 +16,8 @@ pub enum ThemePreset {
 }
 
 impl ThemePreset {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::VibesCrimson,
         Self::PlasmaNative,
         Self::KanagawaDragon,
         Self::BreezeDark,
@@ -24,6 +26,7 @@ impl ThemePreset {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::VibesCrimson => "Vibes Crimson",
             Self::PlasmaNative => "KDE Plasma (kdeglobals)",
             Self::KanagawaDragon => "Kanagawa Dragon",
             Self::BreezeDark => "KDE Breeze Dark",
@@ -59,6 +62,33 @@ pub struct Palette {
 }
 
 impl Palette {
+    pub fn vibes_crimson() -> Self {
+        Self {
+            is_dark: true,
+            bg_deep: 0x120a0d,
+            bg_main: 0x1a1013,
+            bg_sidebar: 0x211519,
+            bg_panel: 0x2c1b21,
+            bg_btn: 0x3c262d,
+            bg_btn_hover: 0x4c313a,
+            bg_btn_active: 0x311f25,
+            border: 0x472e37,
+            border_subtle: 0x301f25,
+            fg: 0xf1e5e8,
+            fg_muted: 0x876e76,
+            fg_subtle: 0xb89fa7,
+            accent: 0xe04f54,
+            accent_hover: 0xec686c,
+            accent_active: 0xc73b40,
+            green: 0x76c289,
+            yellow: 0xe5be78,
+            red: 0xf06565,
+            orange: 0xe28d64,
+            aqua: 0x78b8b6,
+            violet: 0xba8cc9,
+        }
+    }
+
     pub fn kanagawa_dragon() -> Self {
         Self {
             is_dark: true,
@@ -299,10 +329,11 @@ fn kdeglobals_path() -> Option<PathBuf> {
 
 pub fn load_palette(preset: ThemePreset) -> Palette {
     match preset {
+        ThemePreset::VibesCrimson => Palette::vibes_crimson(),
         ThemePreset::PlasmaNative => kdeglobals_path()
             .and_then(|p| fs::read_to_string(p).ok())
             .and_then(|txt| parse_kdeglobals_palette(&txt))
-            .unwrap_or_else(Palette::kanagawa_dragon),
+            .unwrap_or_else(Palette::vibes_crimson),
         ThemePreset::KanagawaDragon => Palette::kanagawa_dragon(),
         ThemePreset::BreezeDark => Palette::breeze_dark(),
         ThemePreset::CatppuccinMocha => Palette::catppuccin_mocha(),
@@ -466,5 +497,14 @@ ForegroundVisited=137,146,167
         assert_eq!(pal.accent, 0x8ba4b0);
         assert_eq!(pal.green, 0x87a987);
         assert_eq!(pal.red, 0xc4746e);
+    }
+
+    #[test]
+    fn loads_vibes_crimson_default_palette() {
+        let pal = load_palette(ThemePreset::default());
+        assert!(pal.is_dark);
+        assert_eq!(ThemePreset::default(), ThemePreset::VibesCrimson);
+        assert_eq!(pal.accent, 0xe04f54);
+        assert_eq!(pal.bg_main, 0x1a1013);
     }
 }

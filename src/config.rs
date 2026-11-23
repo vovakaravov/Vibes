@@ -150,7 +150,7 @@ fn default_country_code() -> String {
 impl Default for VibesConfig {
     fn default() -> Self {
         Self {
-            theme: ThemePreset::PlasmaNative,
+            theme: ThemePreset::VibesCrimson,
             country_code: default_country_code(),
             local_blending: true,
             volume: 80.0,

@@ -31,7 +31,7 @@
   - Left-click: Play/Pause · Middle-click: Show/Hide Window · Scroll wheel: Volume ±5% · Right-click menu with live track info, Play/Pause, Show/Hide Window, **Lyrics Overlay** toggle, Save Current Song, Copy Track Name, Favorites submenu, Sleep Timer (`Off`, `15m`, `30m`, `60m`), and Quit.
 - **MPRIS2 (`zbus`):** Native Plasma Media Player integration, lock screen controls, hardware media keys, and KDE Connect sync.
 - **In-Process `mpv` `lavfi` Spectrum Visualizer:** 16-band Linkwitz-Riley crossover (`acrossover` → `join` → `astats` → `ametadata` over a private FIFO) interpolated to a 24-bar spectrum — runs completely inside `mpv` with zero PipeWire/PulseAudio monitor capture streams (never triggers KDE's microphone tray indicator on Play/Pause), and automatically pauses when hidden in the tray.
-- **KDE Plasma Theme Sync:** Automatically reads `~/.config/kdeglobals` colors, alongside `Kanagawa Dragon`, `KDE Breeze Dark`, and `Catppuccin Mocha` presets.
+- **Velvet Crimson & KDE Plasma Theme Sync:** Defaults to the **Vibes Crimson** dark palette matching the app icon, with **KDE Plasma** (`~/.config/kdeglobals`), `Kanagawa Dragon`, `KDE Breeze Dark`, and `Catppuccin Mocha` presets.
 
 ---
 
