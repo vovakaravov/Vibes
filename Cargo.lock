@@ -6912,6 +6912,7 @@ dependencies = [
  "async-channel",
  "async-io",
  "chrono",
+ "cosmic-text",
  "dirs 6.0.0",
  "gpui-kit",
  "image",
@@ -6922,6 +6923,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "ureq",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "zbus 5.19.0",
 ]
 

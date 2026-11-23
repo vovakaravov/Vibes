@@ -1,6 +1,6 @@
 use ksni::Tray;
 use ksni::blocking::{Handle, TrayMethods};
-use ksni::menu::{MenuItem, StandardItem, SubMenu};
+use ksni::menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,6 +25,7 @@ pub struct TraySnapshot {
     pub favorites: Vec<(String, String)>,
     pub sleep_remaining_mins: Option<u64>,
     pub saving_active: bool,
+    pub lyrics_overlay_open: bool,
 }
 
 impl Default for TraySnapshot {
@@ -41,6 +42,7 @@ impl Default for TraySnapshot {
             favorites: Vec::new(),
             sleep_remaining_mins: None,
             saving_active: false,
+            lyrics_overlay_open: false,
         }
     }
 }
@@ -49,6 +51,7 @@ impl Default for TraySnapshot {
 pub enum TrayAction {
     TogglePlay,
     ToggleWindow,
+    ToggleLyricsOverlay,
     PlayFavorite(String),
     SaveCurrentSong,
     CopyTrackName,
@@ -606,6 +609,15 @@ impl Tray for VibesTray {
             "Show Window"
         };
         items.push(Self::action_item(win_label, "window", TrayAction::ToggleWindow));
+        items.push(
+            CheckmarkItem {
+                label: "Lyrics Overlay".to_string(),
+                checked: self.snap.lyrics_overlay_open,
+                activate: Box::new(|this: &mut Self| this.send(TrayAction::ToggleLyricsOverlay)),
+                ..Default::default()
+            }
+            .into(),
+        );
 
         items.push(MenuItem::Separator);
 

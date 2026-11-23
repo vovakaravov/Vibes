@@ -24,6 +24,9 @@ image = "0.25"
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 percent-encoding = "2"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+cosmic-text = "0.19"
 
 [dev-dependencies]
 tempfile = "3"

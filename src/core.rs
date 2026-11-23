@@ -23,6 +23,7 @@ use crate::lyrics::{
     active_synced_line_index, embed_lyrics_in_file, fetch_lrclib_lyrics, lrclib_to_document,
     new_http_agent, parse_lyrics_text, read_embedded_lyrics, run_library_lyrics_backfill,
 };
+use crate::lyrics_overlay::{LyricsOverlayController, OverlayFrame};
 use crate::mpris::{MprisAction, MprisController, MprisSnapshot};
 use crate::mpv::{MpvController, MpvEvent};
 use crate::radio::{
@@ -244,6 +245,7 @@ pub struct VibesCore {
     lyrics_cache: HashMap<String, LyricsState>,
     pub lyrics_backfill: LyricsBackfillProgress,
     lyrics_backfill_cancel: Option<Arc<AtomicBool>>,
+    lyrics_overlay: LyricsOverlayController,
 }
 
 impl VibesCore {
@@ -442,10 +444,12 @@ impl VibesCore {
             lyrics_cache: HashMap::new(),
             lyrics_backfill: LyricsBackfillProgress::default(),
             lyrics_backfill_cancel: None,
+            lyrics_overlay: LyricsOverlayController::new(),
         };
 
         core.sync_integrations();
         core.refresh_visualizer_state();
+        core.sync_lyrics_overlay();
         core.prefetch_startup_art();
         core.refresh_radio_stations(cx);
         core.refresh_local_library(cx);
@@ -691,6 +695,7 @@ impl VibesCore {
             favorites,
             sleep_remaining_mins: sleep_mins,
             saving_active: self.active_saving_count() > 0,
+            lyrics_overlay_open: self.config.lyrics_overlay_enabled,
         });
 
         let mpris_status = match state {
@@ -948,12 +953,13 @@ impl VibesCore {
         std::thread::spawn(move || client.register_click(&uuid));
 
         self.refresh_visualizer_state();
-        if self.lyrics_open {
+        if self.wants_lyrics() {
             self.refresh_lyrics_for_current(cx);
         } else {
             self.lyrics_track_key = None;
             self.lyrics_state = LyricsState::Empty;
         }
+        self.sync_lyrics_overlay();
         self.sync_integrations();
         cx.notify();
     }
@@ -994,12 +1000,13 @@ impl VibesCore {
         }
 
         self.refresh_visualizer_state();
-        if self.lyrics_open {
+        if self.wants_lyrics() {
             self.refresh_lyrics_for_current(cx);
         } else {
             self.lyrics_track_key = None;
             self.lyrics_state = LyricsState::Empty;
         }
+        self.sync_lyrics_overlay();
         self.sync_integrations();
         cx.notify();
     }
@@ -1037,12 +1044,13 @@ impl VibesCore {
         }
 
         self.refresh_visualizer_state();
-        if self.lyrics_open {
+        if self.wants_lyrics() {
             self.refresh_lyrics_for_current(cx);
         } else {
             self.lyrics_track_key = None;
             self.lyrics_state = LyricsState::Empty;
         }
+        self.sync_lyrics_overlay();
         self.sync_integrations();
         cx.notify();
     }
@@ -1153,6 +1161,7 @@ impl VibesCore {
             }
         }
         self.refresh_visualizer_state();
+        self.sync_lyrics_overlay();
         self.sync_integrations();
         cx.notify();
     }
@@ -1171,6 +1180,7 @@ impl VibesCore {
             let _ = mpv.stop();
         }
         self.refresh_visualizer_state();
+        self.sync_lyrics_overlay();
         self.sync_integrations();
         cx.notify();
     }
@@ -1200,6 +1210,7 @@ impl VibesCore {
         if let Some(ref mpv) = self.mpv {
             let _ = mpv.seek_absolute(target);
         }
+        self.sync_lyrics_overlay();
         cx.notify();
     }
 
@@ -1214,6 +1225,7 @@ impl VibesCore {
         if let Some(ref mpv) = self.mpv {
             let _ = mpv.seek_relative(delta);
         }
+        self.sync_lyrics_overlay();
         cx.notify();
     }
 
@@ -1529,6 +1541,7 @@ impl VibesCore {
         self.palette = load_palette(preset);
         apply_palette(cx, &self.palette);
         self.persist_config();
+        self.sync_lyrics_overlay();
         cx.notify();
     }
 
@@ -1548,6 +1561,102 @@ impl VibesCore {
         self.config.visualizer_enabled = !self.config.visualizer_enabled;
         self.persist_config();
         self.refresh_visualizer_state();
+        cx.notify();
+    }
+
+    fn wants_lyrics(&self) -> bool {
+        self.lyrics_open || self.config.lyrics_overlay_enabled
+    }
+
+    fn overlay_header_for_current(&self) -> String {
+        match &self.current_target {
+            Some(PlayTarget::Local(t)) => {
+                if t.artist.trim().is_empty() || t.artist.eq_ignore_ascii_case("Unknown Artist") {
+                    format!("♪ {}", t.title)
+                } else {
+                    format!("♪ {} — {}", t.artist, t.title)
+                }
+            }
+            Some(PlayTarget::Youtube(y)) => {
+                let ch = y.channel.strip_suffix(" - Topic").unwrap_or(&y.channel).trim();
+                if ch.is_empty() {
+                    format!("♪ {}", y.title)
+                } else {
+                    format!("♪ {} — {}", ch, y.title)
+                }
+            }
+            Some(PlayTarget::Radio(s)) => match self.current_track_text() {
+                Some(tr) => format!("♪ {tr}"),
+                None => format!("♪ {}", s.name),
+            },
+            None => "♪ Vibes".to_string(),
+        }
+    }
+
+    fn sync_lyrics_overlay(&self) {
+        if !self.config.lyrics_overlay_enabled {
+            self.lyrics_overlay.set_disabled();
+            return;
+        }
+        if !self.playing || self.paused {
+            self.lyrics_overlay.hide();
+            return;
+        }
+        let (primary, secondary) = match &self.lyrics_state {
+            LyricsState::Loading => ("Searching lyrics…".to_string(), None),
+            LyricsState::Ready(doc) => match &doc.kind {
+                LyricsKind::Synced(lines) => {
+                    match active_synced_line_index(lines, self.position_secs) {
+                        Some(idx) => {
+                            let pri = lines[idx].text.clone();
+                            let sec = lines.get(idx + 1).map(|l| l.text.clone());
+                            (pri, sec)
+                        }
+                        None => (
+                            "♪ …".to_string(),
+                            lines.first().map(|l| l.text.clone()),
+                        ),
+                    }
+                }
+                LyricsKind::Plain(_) => (
+                    "Unsynced lyrics available".to_string(),
+                    Some("Open Vibes (L) to read".to_string()),
+                ),
+                LyricsKind::Instrumental => {
+                    self.lyrics_overlay.hide();
+                    return;
+                }
+            },
+            LyricsState::Empty | LyricsState::NotFound => {
+                self.lyrics_overlay.hide();
+                return;
+            }
+        };
+
+        self.lyrics_overlay.show(OverlayFrame {
+            header: self.overlay_header_for_current(),
+            primary,
+            secondary,
+            bg_rgb: self.palette.bg_deep,
+            border_rgb: self.palette.border,
+            accent_rgb: self.palette.accent,
+            fg_rgb: self.palette.fg,
+            muted_rgb: self.palette.fg_muted,
+        });
+    }
+
+    pub fn toggle_lyrics_overlay(&mut self, cx: &mut Context<Self>) {
+        self.config.lyrics_overlay_enabled = !self.config.lyrics_overlay_enabled;
+        self.persist_config();
+        if self.config.lyrics_overlay_enabled {
+            self.refresh_lyrics_for_current(cx);
+            self.sync_lyrics_overlay();
+            self.show_toast("Lyrics overlay enabled (click-through)", cx);
+        } else {
+            self.lyrics_overlay.set_disabled();
+            self.show_toast("Lyrics overlay disabled", cx);
+        }
+        self.sync_integrations();
         cx.notify();
     }
 
@@ -2075,6 +2184,7 @@ impl VibesCore {
                 if !self.is_live_stream() && !self.user_stopped && self.playing {
                     self.paused = p;
                     self.refresh_visualizer_state();
+                    self.sync_lyrics_overlay();
                     sync_dbus = true;
                     dirty_ui = true;
                 }
@@ -2093,6 +2203,7 @@ impl VibesCore {
                     self.playing = true;
                 }
                 self.refresh_visualizer_state();
+                self.sync_lyrics_overlay();
                 sync_dbus = true;
                 dirty_ui = true;
             }
@@ -2101,10 +2212,12 @@ impl VibesCore {
                 self.media_title = Some(title.clone());
                 if changed {
                     self.record_song_log(&title);
-                    if self.lyrics_open && matches!(self.current_target, Some(PlayTarget::Radio(_)))
+                    if self.wants_lyrics()
+                        && matches!(self.current_target, Some(PlayTarget::Radio(_)))
                     {
                         self.refresh_lyrics_for_current(cx);
                     }
+                    self.sync_lyrics_overlay();
                     sync_dbus = true;
                     dirty_ui = true;
                 }
@@ -2115,9 +2228,10 @@ impl VibesCore {
                     self.icy_title = Some(t.clone());
                     if changed {
                         self.record_song_log(&t);
-                        if self.lyrics_open {
+                        if self.wants_lyrics() {
                             self.refresh_lyrics_for_current(cx);
                         }
+                        self.sync_lyrics_overlay();
                         sync_dbus = true;
                         dirty_ui = true;
                     }
@@ -2131,15 +2245,19 @@ impl VibesCore {
                 let prev_pos = self.position_secs;
                 let prev_whole = prev_pos as u64;
                 self.position_secs = pos;
-                if (pos as u64) != prev_whole {
-                    dirty_ui = true;
-                } else if self.lyrics_open
-                    && let LyricsState::Ready(ref doc) = self.lyrics_state
+                let line_changed = if let LyricsState::Ready(ref doc) = self.lyrics_state
                     && let LyricsKind::Synced(ref lines) = doc.kind
-                    && active_synced_line_index(lines, prev_pos)
-                        != active_synced_line_index(lines, pos)
                 {
+                    active_synced_line_index(lines, prev_pos)
+                        != active_synced_line_index(lines, pos)
+                } else {
+                    false
+                };
+                if (pos as u64) != prev_whole || (self.lyrics_open && line_changed) {
                     dirty_ui = true;
+                }
+                if self.config.lyrics_overlay_enabled && line_changed {
+                    self.sync_lyrics_overlay();
                 }
             }
             MpvEvent::DurationChanged(d) => {
@@ -2207,6 +2325,7 @@ impl VibesCore {
                             self.paused = false;
                             self.buffering = false;
                             self.refresh_visualizer_state();
+                            self.sync_lyrics_overlay();
                             sync_dbus = true;
                             dirty_ui = true;
                         }
@@ -2234,6 +2353,7 @@ impl VibesCore {
                             } else {
                                 self.playing = false;
                                 self.buffering = false;
+                                self.sync_lyrics_overlay();
                                 self.show_toast("Stream dropped after 3 reconnect attempts", cx);
                                 sync_dbus = true;
                                 dirty_ui = true;
@@ -2265,6 +2385,7 @@ impl VibesCore {
             TrayAction::ToggleWindow => {
                 let _ = self.window_tx.try_send(WindowCmd::Toggle);
             }
+            TrayAction::ToggleLyricsOverlay => self.toggle_lyrics_overlay(cx),
             TrayAction::PlayFavorite(uuid) => {
                 if let Some(st) = self
                     .state
@@ -2530,6 +2651,7 @@ impl VibesCore {
                     && self.lyrics_track_key.as_deref() == Some(key.as_str())
                 {
                     self.lyrics_state = state;
+                    self.sync_lyrics_overlay();
                     if self.window_open {
                         cx.notify();
                     }
@@ -2548,7 +2670,7 @@ impl VibesCore {
                         cx,
                     );
                     if prog.embedded > 0
-                        && self.lyrics_open
+                        && self.wants_lyrics()
                         && matches!(self.current_target, Some(PlayTarget::Local(_)))
                     {
                         self.force_reload_lyrics(cx);
@@ -2565,6 +2687,7 @@ impl VibesCore {
         if let Some(ref cancel) = self.lyrics_backfill_cancel {
             cancel.store(true, Ordering::Release);
         }
+        self.lyrics_overlay.shutdown();
         self.save_current_yt_resume();
         self.persist_config();
         self.persist_state();

@@ -6,6 +6,7 @@ mod downloader;
 mod instance;
 mod local_library;
 mod lyrics;
+mod lyrics_overlay;
 mod mpris;
 mod mpv;
 mod radio;

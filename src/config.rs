@@ -102,6 +102,8 @@ pub struct VibesConfig {
     pub visualizer_enabled: bool,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    #[serde(default)]
+    pub lyrics_overlay_enabled: bool,
     #[serde(default = "default_music_dir")]
     pub music_dir: PathBuf,
     #[serde(default)]
@@ -154,6 +156,7 @@ impl Default for VibesConfig {
             volume: 80.0,
             visualizer_enabled: true,
             close_to_tray: true,
+            lyrics_overlay_enabled: false,
             music_dir: default_music_dir(),
             save_folder_mode: SaveFolderMode::Flat,
             save_audio_format: SaveAudioFormat::Opus,
@@ -262,6 +265,7 @@ mod tests {
             volume: 65.0,
             visualizer_enabled: false,
             close_to_tray: true,
+            lyrics_overlay_enabled: false,
             music_dir: tmp.path().join("Music"),
             save_folder_mode: SaveFolderMode::ByArtist,
             save_audio_format: SaveAudioFormat::Opus,
