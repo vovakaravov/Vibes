@@ -6,17 +6,18 @@ use crate::youtube::format_duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Input;
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
+    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _, px, uniform_list,
 };
 use std::path::PathBuf;
 
 pub fn render_local_view(
     win: &mut VibesWindow,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<VibesWindow>,
 ) -> impl IntoElement {
     let (
@@ -29,6 +30,7 @@ pub fn render_local_view(
         albums_dir,
         active_local_path,
         lyrics_backfill,
+        lyrics_open,
     ) = {
         let core = win.core.read(cx);
         let active_path = match &core.current_target {
@@ -45,6 +47,7 @@ pub fn render_local_view(
             core.config.albums_dir.clone(),
             active_path,
             core.lyrics_backfill.clone(),
+            core.lyrics_open,
         )
     };
 
@@ -265,11 +268,27 @@ pub fn render_local_view(
                 &filter_query,
                 loading,
                 active_local_path.as_ref(),
+                lyrics_open,
                 &pal,
-                cx,
+                window,
             )
-            .into_any_element()
         })
+}
+
+fn compute_album_grid_cols(viewport_width: f32, lyrics_open: bool) -> usize {
+    const SIDEBAR_WIDTH: f32 = 210.0;
+    const LYRICS_WIDTH: f32 = 320.0;
+    const OUTER_PAD_X: f32 = 32.0;
+    const SCROLLBAR_PAD: f32 = 12.0;
+    const CARD_WIDTH: f32 = 172.0;
+    const CARD_GAP: f32 = 12.0;
+
+    let used = SIDEBAR_WIDTH
+        + if lyrics_open { LYRICS_WIDTH } else { 0.0 }
+        + OUTER_PAD_X
+        + SCROLLBAR_PAD;
+    let avail = (viewport_width - used).max(CARD_WIDTH);
+    (((avail + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).floor() as usize).max(1)
 }
 
 fn format_album_subtitle(album: &LocalAlbum) -> String {
@@ -289,16 +308,23 @@ fn format_album_subtitle(album: &LocalAlbum) -> String {
     parts.join(" · ")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_local_albums_list(
-    win: &VibesWindow,
+    win: &mut VibesWindow,
     albums: &[LocalAlbum],
     filter_query: &str,
     loading: bool,
     active_local_path: Option<&PathBuf>,
+    lyrics_open: bool,
     pal: &Palette,
-    cx: &mut Context<VibesWindow>,
-) -> impl IntoElement {
+    window: &Window,
+) -> AnyElement {
     let pal = pal.clone();
+    if win.last_local_filter != filter_query {
+        win.last_local_filter = filter_query.to_string();
+        win.local_albums_scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
+
     let q = filter_query.trim().to_lowercase();
     let filtered: Vec<LocalAlbum> = if q.is_empty() {
         albums.to_vec()
@@ -314,12 +340,11 @@ fn render_local_albums_list(
             .collect()
     };
 
-    v_flex()
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scrollbar()
-        .when(filtered.is_empty(), |list| {
-            list.child(
+    if filtered.is_empty() {
+        return v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
                 div()
                     .p_6()
                     .text_xs()
@@ -332,125 +357,149 @@ fn render_local_albums_list(
                         "No local albums match your filter."
                     }),
             )
-        })
-        .when(!filtered.is_empty(), |list| {
-            list.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .pb_2()
-                    .children(filtered.into_iter().enumerate().map(|(ix, alb)| {
-                        let core_open = win.core.clone();
-                        let core_play = win.core.clone();
-                        let folder_open = alb.folder.clone();
-                        let alb_play = alb.clone();
-                        let is_playing_album = active_local_path
-                            .is_some_and(|p| alb.tracks.iter().any(|t| &t.path == p));
-                        let fmt_badge = alb.format_summary();
-                        let trk_count = alb.tracks.len();
-                        let meta_txt = if is_playing_album {
-                            format!("PLAYING · {trk_count} trk")
-                        } else {
-                            format!("{trk_count} trk · {fmt_badge}")
-                        };
+            .into_any_element();
+    }
 
-                        div()
-                            .id(SharedString::from(format!("loc-alb-{ix}")))
-                            .w(px(172.))
-                            .p_2p5()
-                            .rounded(px(9.))
-                            .cursor_pointer()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .bg(if is_playing_album {
-                                rgb_with_alpha(pal.accent, 0x20)
-                            } else {
-                                hsla(pal.bg_sidebar)
-                            })
-                            .border_1()
-                            .border_color(hsla(if is_playing_album {
-                                pal.accent
-                            } else {
-                                pal.border_subtle
-                            }))
-                            .hover(|s| s.bg(hsla(pal.bg_panel)))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                let f = folder_open.clone();
-                                core_open.update(cx, |c, cx| c.select_local_album(Some(f), cx));
-                            }))
-                            .child(art::render_art_tile(
-                                alb.cover_path.as_ref(),
-                                150.,
-                                7.,
-                                IconName::Disc3,
-                                &alb.title,
-                                is_playing_album,
-                                &pal,
-                            ))
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap_0p5()
+    let cols = compute_album_grid_cols(f32::from(window.viewport_size().width), lyrics_open);
+    let row_count = filtered.len().div_ceil(cols);
+    let core = win.core.clone();
+    let active_local_path = active_local_path.cloned();
+    let scroll_handle = win.local_albums_scroll.clone();
+
+    div()
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .child(
+            uniform_list("local-albums-grid", row_count, move |range, _window, _cx| {
+                range
+                    .map(|row_ix| {
+                        let start = row_ix * cols;
+                        let end = (start + cols).min(filtered.len());
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .pb_3()
+                            .children((start..end).map(|ix| {
+                                let alb = filtered[ix].clone();
+                                let core_open = core.clone();
+                                let core_play = core.clone();
+                                let folder_open = alb.folder.clone();
+                                let alb_play = alb.clone();
+                                let is_playing_album = active_local_path
+                                    .as_ref()
+                                    .is_some_and(|p| alb.tracks.iter().any(|t| &t.path == p));
+                                let fmt_badge = alb.format_summary();
+                                let trk_count = alb.tracks.len();
+                                let meta_txt = if is_playing_album {
+                                    format!("PLAYING · {trk_count} trk")
+                                } else {
+                                    format!("{trk_count} trk · {fmt_badge}")
+                                };
+
+                                div()
+                                    .id(SharedString::from(format!("loc-alb-{ix}")))
+                                    .w(px(172.))
+                                    .p_2p5()
+                                    .rounded(px(9.))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .bg(if is_playing_album {
+                                        rgb_with_alpha(pal.accent, 0x20)
+                                    } else {
+                                        hsla(pal.bg_sidebar)
+                                    })
+                                    .border_1()
+                                    .border_color(hsla(if is_playing_album {
+                                        pal.accent
+                                    } else {
+                                        pal.border_subtle
+                                    }))
+                                    .hover(|s| s.bg(hsla(pal.bg_panel)))
+                                    .on_click(move |_, _, cx| {
+                                        let f = folder_open.clone();
+                                        core_open
+                                            .update(cx, |c, cx| c.select_local_album(Some(f), cx));
+                                    })
+                                    .child(art::render_art_tile(
+                                        alb.cover_path.as_ref(),
+                                        150.,
+                                        7.,
+                                        IconName::Disc3,
+                                        &alb.title,
+                                        is_playing_album,
+                                        &pal,
+                                    ))
                                     .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(hsla(if is_playing_album {
-                                                pal.accent
-                                            } else {
-                                                pal.fg
-                                            }))
-                                            .truncate()
-                                            .child(alb.title),
+                                        v_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .gap_0p5()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(hsla(if is_playing_album {
+                                                        pal.accent
+                                                    } else {
+                                                        pal.fg
+                                                    }))
+                                                    .truncate()
+                                                    .child(alb.title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(hsla(pal.fg_muted))
+                                                    .truncate()
+                                                    .child(alb.artist),
+                                            ),
                                     )
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(hsla(pal.fg_muted))
-                                            .truncate()
-                                            .child(alb.artist),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_between()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(hsla(if is_playing_album {
-                                                pal.green
-                                            } else {
-                                                pal.fg_muted
-                                            }))
-                                            .truncate()
-                                            .child(meta_txt),
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(hsla(if is_playing_album {
+                                                        pal.green
+                                                    } else {
+                                                        pal.fg_muted
+                                                    }))
+                                                    .truncate()
+                                                    .child(meta_txt),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "loc-alb-play-{ix}"
+                                                )))
+                                                .primary()
+                                                .xsmall()
+                                                .icon(IconName::Play)
+                                                .on_click(move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    let a = alb_play.clone();
+                                                    core_play.update(cx, |c, cx| {
+                                                        c.play_local_album_from(&a, 0, cx)
+                                                    });
+                                                }),
+                                            ),
                                     )
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "loc-alb-play-{ix}"
-                                        )))
-                                        .primary()
-                                        .xsmall()
-                                        .icon(IconName::Play)
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.stop_propagation();
-                                            let a = alb_play.clone();
-                                            core_play.update(cx, |c, cx| {
-                                                c.play_local_album_from(&a, 0, cx)
-                                            });
-                                        })),
-                                    ),
-                            )
-                    })),
-            )
-        })
+                            }))
+                    })
+                    .collect()
+            })
+            .size_full()
+            .track_scroll(&scroll_handle),
+        )
+        .child(Scrollbar::vertical(&scroll_handle))
+        .into_any_element()
 }
 
 fn render_local_album_detail(
@@ -885,4 +934,23 @@ fn render_local_singles_list(
                         ),
                 )
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_album_grid_cols;
+
+    #[test]
+    fn compute_album_grid_cols_accounts_for_viewport_and_lyrics_panel() {
+        assert_eq!(compute_album_grid_cols(0.0, false), 1);
+        assert_eq!(compute_album_grid_cols(420.0, false), 1);
+        assert_eq!(compute_album_grid_cols(630.0, false), 2);
+        assert_eq!(compute_album_grid_cols(1100.0, false), 4);
+        assert_eq!(compute_album_grid_cols(1280.0, false), 5);
+        assert_eq!(compute_album_grid_cols(1920.0, false), 9);
+
+        assert_eq!(compute_album_grid_cols(1100.0, true), 2);
+        assert_eq!(compute_album_grid_cols(1280.0, true), 3);
+        assert_eq!(compute_album_grid_cols(420.0, true), 1);
+    }
 }

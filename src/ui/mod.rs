@@ -17,8 +17,8 @@ use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Render, ScrollHandle, Styled, Subscription, Window, div,
-    prelude::FluentBuilder as _, px,
+    ParentElement, Render, ScrollHandle, Styled, Subscription, UniformListScrollHandle, Window,
+    div, prelude::FluentBuilder as _, px,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -43,6 +43,8 @@ pub struct VibesWindow {
     pub dragging_seek: bool,
     pub dragging_vol: bool,
     pub image_cache: Entity<art::LruImageCache>,
+    pub local_albums_scroll: UniformListScrollHandle,
+    pub last_local_filter: String,
     pub lyrics_scroll: ScrollHandle,
     pub last_scrolled_lyric_idx: Option<usize>,
     pub last_lyrics_key: Option<String>,
@@ -86,7 +88,7 @@ impl VibesWindow {
         let local_search_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Filter offline albums, artists, or saved tracks…")
-                .default_value(initial_loc_q)
+                .default_value(initial_loc_q.clone())
         });
         let custom_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Station name (e.g. SomaFM Groove Salad)")
@@ -180,7 +182,7 @@ impl VibesWindow {
 
         let fh = cx.focus_handle();
         fh.focus(window, cx);
-        let image_cache = art::LruImageCache::new(48, cx);
+        let image_cache = art::LruImageCache::new(64, cx);
 
         Self {
             core,
@@ -199,6 +201,8 @@ impl VibesWindow {
             dragging_seek: false,
             dragging_vol: false,
             image_cache,
+            local_albums_scroll: UniformListScrollHandle::new(),
+            last_local_filter: initial_loc_q,
             lyrics_scroll: ScrollHandle::new(),
             last_scrolled_lyric_idx: None,
             last_lyrics_key: None,
@@ -332,6 +336,9 @@ impl VibesWindow {
 
 impl Render for VibesWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.image_cache
+            .update(cx, |cache, cx| cache.begin_frame(window, cx));
+
         let (pal, compact, section, toast, mpv_err, lyrics_open) = {
             let core = self.core.read(cx);
             (
