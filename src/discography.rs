@@ -959,6 +959,7 @@ pub fn run_artist_sync(
             }
         } else {
             let mut filtered_details = details.clone();
+            filtered_details.summary.artist = disco.artist.name.clone();
             filtered_details.tracks = filtered_tracks;
             let (alb_status, failures) = download_album_tracks_with_failures(
                 albums_dir,

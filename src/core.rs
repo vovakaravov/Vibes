@@ -17,8 +17,8 @@ use crate::discography::{
     normalize_artist_key, run_artist_sync, search_artists,
 };
 use crate::downloader::{
-    DownloadJob, DownloadStatus, ParsedTrack, parse_identifiable_track, run_retry_failed_item,
-    run_save_song,
+    DownloadJob, DownloadStatus, ParsedTrack, find_existing_for_failed_item, is_yt_auth_gate_error,
+    parse_identifiable_track, run_retry_failed_item, run_save_song,
 };
 use crate::instance::InstanceGuard;
 use crate::local_library::{
@@ -186,6 +186,7 @@ enum CoreBgEvent {
         id: String,
         res: Result<PathBuf, String>,
     },
+    FailedRetryBatchFinished,
     ReorgCompleted(Result<ReorgReport, String>),
     StreamUrlPrefetched {
         video_id: String,
@@ -271,6 +272,7 @@ pub struct VibesCore {
     pub selected_local_album: Option<PathBuf>,
     pub selected_playlist_id: Option<String>,
     pub reorg_running: bool,
+    pub retry_all_running: bool,
 
     // Stream prefetch cache (video_id -> (resolved stream, fetched_at))
     stream_url_cache: HashMap<String, (ResolvedYoutubeStream, Instant)>,
@@ -505,6 +507,7 @@ impl VibesCore {
             selected_local_album: None,
             selected_playlist_id: None,
             reorg_running: false,
+            retry_all_running: false,
 
             stream_url_cache: HashMap::new(),
             prefetching_video_ids: HashSet::new(),
@@ -1862,11 +1865,42 @@ impl VibesCore {
         cx.notify();
     }
 
+    fn prune_resolved_failed_downloads(&mut self) -> usize {
+        if self.state.failed_downloads.is_empty() {
+            return 0;
+        }
+        let before = self.state.failed_downloads.len();
+        let albums_dir = &self.config.albums_dir;
+        let format = self.config.save_audio_format;
+        self.state
+            .failed_downloads
+            .retain(|f| find_existing_for_failed_item(f, albums_dir, format).is_none());
+        let removed = before - self.state.failed_downloads.len();
+        if removed > 0 {
+            self.persist_state();
+            self.sync_integrations();
+        }
+        removed
+    }
+
     pub fn retry_all_failed_downloads(&mut self, cx: &mut Context<Self>) {
-        let items = self.state.failed_downloads.clone();
-        if items.is_empty() {
+        if self.retry_all_running {
+            self.show_toast("Retry batch already running", cx);
             return;
         }
+        let pruned = self.prune_resolved_failed_downloads();
+        let items = self.state.failed_downloads.clone();
+        if items.is_empty() {
+            if pruned > 0 {
+                self.show_toast(
+                    format!("Cleared {pruned} already-downloaded items — nothing left to retry"),
+                    cx,
+                );
+                cx.notify();
+            }
+            return;
+        }
+        self.retry_all_running = true;
         self.show_toast(format!("Retrying {} failed downloads…", items.len()), cx);
         let albums_dir = self.config.albums_dir.clone();
         let format = self.config.save_audio_format;
@@ -1877,8 +1911,13 @@ impl VibesCore {
                 let fid = item.id.clone();
                 let res = run_retry_failed_item(&item, &albums_dir, format, cookies.as_deref())
                     .map_err(|e| format!("{e}"));
+                let stop_auth = res.as_ref().is_err_and(|e| is_yt_auth_gate_error(e));
                 let _ = tx.send_blocking(CoreBgEvent::FailedItemRetried { id: fid, res });
+                if stop_auth {
+                    break;
+                }
             }
+            let _ = tx.send_blocking(CoreBgEvent::FailedRetryBatchFinished);
         });
         cx.notify();
     }
@@ -3482,6 +3521,7 @@ impl VibesCore {
                 if !failures.is_empty() {
                     self.record_failed_downloads(failures);
                 }
+                self.prune_resolved_failed_downloads();
                 match status {
                     AlbumDownloadStatus::Completed {
                         saved,
@@ -3580,6 +3620,7 @@ impl VibesCore {
                 } else {
                     self.persist_state();
                 }
+                self.prune_resolved_failed_downloads();
                 self.show_toast(status.summary_line(), cx);
                 self.refresh_local_library(cx);
                 self.sync_integrations();
@@ -3630,6 +3671,12 @@ impl VibesCore {
                     cx.notify();
                 }
             }
+            CoreBgEvent::FailedRetryBatchFinished => {
+                self.retry_all_running = false;
+                if self.window_open {
+                    cx.notify();
+                }
+            }
             CoreBgEvent::ReorgCompleted(res) => {
                 self.reorg_running = false;
                 match res {
@@ -3668,6 +3715,7 @@ impl VibesCore {
                     return;
                 }
                 self.local_library_loading = false;
+                self.prune_resolved_failed_downloads();
                 if let Some(ref sel) = self.selected_local_album
                     && !snapshot.albums.iter().any(|a| &a.folder == sel)
                 {

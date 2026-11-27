@@ -472,6 +472,34 @@ pub fn is_yt_auth_gate_error(err: &str) -> bool {
     err.contains("Sign in to confirm") || err.contains("cookies-from-browser")
 }
 
+fn cleanup_failed_ytdlp_artifacts(dest_dir: &Path, clean_name: &str, include_sidecars: bool) {
+    let Ok(entries) = fs::read_dir(dest_dir) else {
+        return;
+    };
+    let sidecar_names = include_sidecars.then(|| {
+        [
+            format!("{clean_name}.info.json"),
+            format!("{clean_name}.webp"),
+            format!("{clean_name}.jpg"),
+            format!("{clean_name}.png"),
+        ]
+    });
+    for e in entries.flatten() {
+        let p = e.path();
+        let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if !fname.starts_with(clean_name) {
+            continue;
+        }
+        let is_temp = fname.ends_with(".part") || fname.contains(".temp.");
+        let is_sidecar = sidecar_names
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|s| s == fname));
+        if is_temp || is_sidecar {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
 /// Retries `extract_ytdlp_audio` once after a short backoff and removes partial leftovers on failure.
 pub fn extract_ytdlp_audio_with_retry(
     url: &str,
@@ -493,6 +521,7 @@ pub fn extract_ytdlp_audio_with_retry(
         Err(first_err) => {
             let err_txt = format!("{first_err}");
             if is_yt_auth_gate_error(&err_txt) {
+                cleanup_failed_ytdlp_artifacts(dest_dir, clean_name, write_sidecars);
                 return Err(first_err);
             }
             std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -505,15 +534,7 @@ pub fn extract_ytdlp_audio_with_retry(
                 cookies_browser,
             );
             if res.is_err() {
-                if let Ok(entries) = fs::read_dir(dest_dir) {
-                    for e in entries.flatten() {
-                        let p = e.path();
-                        let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                        if fname.starts_with(clean_name) && fname.ends_with(".part") {
-                            let _ = fs::remove_file(&p);
-                        }
-                    }
-                }
+                cleanup_failed_ytdlp_artifacts(dest_dir, clean_name, write_sidecars);
             }
             res
         }
@@ -1003,12 +1024,71 @@ pub fn run_save_song(
     status
 }
 
+fn non_empty_audio_file(path: &Path) -> bool {
+    path.is_file() && fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+pub fn find_existing_for_failed_item(
+    item: &FailedDownloadItem,
+    albums_dir: &Path,
+    format: SaveAudioFormat,
+) -> Option<PathBuf> {
+    let is_singles = item
+        .album
+        .as_deref()
+        .is_none_or(|a| a.eq_ignore_ascii_case("singles"));
+
+    if let Some(num) = item.track_number
+        && !is_singles
+    {
+        let expected = item
+            .dest_dir
+            .join(format!("{num:02} - {}.{}", sanitize_filename(&item.title), format.extension()));
+        if non_empty_audio_file(&expected) {
+            return Some(expected);
+        }
+        if let Some(hit) =
+            crate::local_library::find_local_track_in_dir(&item.dest_dir, num, &item.title)
+                .filter(|p| non_empty_audio_file(p))
+        {
+            return Some(hit);
+        }
+    }
+
+    if !item.artist.trim().is_empty() {
+        let artist_dir = find_canonical_artist_dir(albums_dir, &item.artist);
+        if is_singles {
+            if let Some(hit) = artist_has_track(&artist_dir, &item.title)
+                .filter(|p| non_empty_audio_file(p))
+            {
+                return Some(hit);
+            }
+        } else if let Some(ref album) = item.album
+            && let Some(alb_dir) =
+                crate::local_library::find_local_album_dir(albums_dir, &item.artist, album)
+            && let Some(hit) = crate::local_library::find_local_track_in_dir(
+                &alb_dir,
+                item.track_number.unwrap_or(0),
+                &item.title,
+            )
+            .filter(|p| non_empty_audio_file(p))
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 pub fn run_retry_failed_item(
     item: &FailedDownloadItem,
     albums_dir: &Path,
     format: SaveAudioFormat,
     cookies_browser: Option<&str>,
 ) -> Result<PathBuf> {
+    if let Some(existing) = find_existing_for_failed_item(item, albums_dir, format) {
+        return Ok(existing);
+    }
+
     let url = item
         .url
         .as_deref()
@@ -1285,5 +1365,35 @@ mod tests {
         };
         write_tags_and_cover(&opus_path, &lyric_spec, Some(&cover_bytes)).unwrap();
         assert_eq!(crate::lyrics::read_embedded_lyrics(&opus_path).as_deref(), Some(lrc));
+    }
+
+    #[test]
+    fn retry_skips_already_downloaded_album_track_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let album_dir = dir.path().join("Metallica").join("Garage, Inc");
+        fs::create_dir_all(&album_dir).unwrap();
+        let existing = album_dir.join("04 - Turn The Page.opus");
+        fs::write(&existing, vec![0x4fu8, 0x67, 0x67, 0x53, 1, 2, 3, 4]).unwrap();
+
+        let item = FailedDownloadItem {
+            id: "alb-test".into(),
+            kind: crate::config::FailedDownloadKind::AlbumTrack,
+            artist: "Metallica".into(),
+            album: Some("Garage, Inc".into()),
+            title: "Turn The Page".into(),
+            track_number: Some(4),
+            url: None,
+            dest_dir: album_dir,
+            error: "old failure".into(),
+            failed_at: "2026-11-27 13:36".into(),
+        };
+
+        assert_eq!(
+            find_existing_for_failed_item(&item, dir.path(), SaveAudioFormat::Opus),
+            Some(existing.clone())
+        );
+        // Must succeed immediately without touching network even when url is None
+        let res = run_retry_failed_item(&item, dir.path(), SaveAudioFormat::Opus, None).unwrap();
+        assert_eq!(res, existing);
     }
 }
