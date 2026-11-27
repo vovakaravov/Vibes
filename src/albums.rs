@@ -712,7 +712,8 @@ pub fn download_album_tracks_with_failures(
                 saved += 1;
             }
             Err(err) => {
-                let msg = format!("Album track download failed ({}): {err}", track.title);
+                let err_str = format!("{err}");
+                let msg = format!("Album track download failed ({}): {err_str}", track.title);
                 crate::log::log_warn("albums", &msg);
                 eprintln!("Vibes {msg}");
                 failures.push(FailedDownloadItem {
@@ -728,9 +729,16 @@ pub fn download_album_tracks_with_failures(
                     track_number: (!is_single_release).then_some(track.track_number),
                     url: Some(track.url.clone()),
                     dest_dir: album_dir.clone(),
-                    error: format!("{err}"),
+                    error: err_str.clone(),
                     failed_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
                 });
+                if crate::downloader::is_yt_auth_gate_error(&err_str) {
+                    crate::log::log_warn(
+                        "albums",
+                        "Stopping album download early: YouTube requested sign-in",
+                    );
+                    break;
+                }
             }
         }
     }

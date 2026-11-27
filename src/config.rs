@@ -92,6 +92,7 @@ impl AlbumFolderMode {
 pub enum YoutubeCookiesSource {
     #[default]
     None,
+    Helium,
     Firefox,
     Chromium,
     Chrome,
@@ -102,8 +103,9 @@ pub enum YoutubeCookiesSource {
 }
 
 impl YoutubeCookiesSource {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::None,
+        Self::Helium,
         Self::Firefox,
         Self::Chromium,
         Self::Chrome,
@@ -113,22 +115,35 @@ impl YoutubeCookiesSource {
         Self::Opera,
     ];
 
-    pub fn ytdlp_arg(self) -> Option<&'static str> {
+    pub fn ytdlp_arg(self) -> Option<String> {
         match self {
             Self::None => None,
-            Self::Firefox => Some("firefox"),
-            Self::Chromium => Some("chromium"),
-            Self::Chrome => Some("chrome"),
-            Self::Brave => Some("brave"),
-            Self::Vivaldi => Some("vivaldi"),
-            Self::Edge => Some("edge"),
-            Self::Opera => Some("opera"),
+            Self::Helium => {
+                let base = dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("net.imput.helium");
+                let default_prof = base.join("Default");
+                let profile = if default_prof.is_dir() {
+                    default_prof
+                } else {
+                    base
+                };
+                Some(format!("chromium:{}", profile.display()))
+            }
+            Self::Firefox => Some("firefox".to_string()),
+            Self::Chromium => Some("chromium".to_string()),
+            Self::Chrome => Some("chrome".to_string()),
+            Self::Brave => Some("brave".to_string()),
+            Self::Vivaldi => Some("vivaldi".to_string()),
+            Self::Edge => Some("edge".to_string()),
+            Self::Opera => Some("opera".to_string()),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::None => "Off",
+            Self::Helium => "Helium",
             Self::Firefox => "Firefox",
             Self::Chromium => "Chromium",
             Self::Chrome => "Chrome",
@@ -480,5 +495,9 @@ mod tests {
         let parsed_state: VibesState =
             serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
         assert_eq!(state, parsed_state);
+
+        let helium_arg = YoutubeCookiesSource::Helium.ytdlp_arg().unwrap();
+        assert!(helium_arg.starts_with("chromium:"));
+        assert!(helium_arg.contains("net.imput.helium"));
     }
 }

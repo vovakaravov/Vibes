@@ -353,7 +353,7 @@ impl VibesCore {
 
         let (mpv, mpv_error) = match MpvController::spawn(
             config.volume,
-            config.yt_cookies_browser.ytdlp_arg(),
+            config.yt_cookies_browser.ytdlp_arg().as_deref(),
             mpv_tx,
         ) {
             Ok(c) => (Some(c), None),
@@ -1146,7 +1146,8 @@ impl VibesCore {
         let cookies = self.config.yt_cookies_browser.ytdlp_arg();
         let _ = cx;
         std::thread::spawn(move || {
-            let res = resolve_youtube_audio_stream(&url, cookies).map_err(|e| format!("{e}"));
+            let res = resolve_youtube_audio_stream(&url, cookies.as_deref())
+                .map_err(|e| format!("{e}"));
             let _ = tx.send_blocking(CoreBgEvent::StreamUrlPrefetched { video_id: vid, res });
         });
     }
@@ -1814,7 +1815,7 @@ impl VibesCore {
             run_save_song(
                 &albums_dir,
                 format,
-                cookies,
+                cookies.as_deref(),
                 &parsed,
                 &source_station,
                 direct_url.as_deref(),
@@ -1854,7 +1855,7 @@ impl VibesCore {
         let tx = self.bg_tx.clone();
         let fid = item.id.clone();
         std::thread::spawn(move || {
-            let res = run_retry_failed_item(&item, &albums_dir, format, cookies)
+            let res = run_retry_failed_item(&item, &albums_dir, format, cookies.as_deref())
                 .map_err(|e| format!("{e}"));
             let _ = tx.send_blocking(CoreBgEvent::FailedItemRetried { id: fid, res });
         });
@@ -1874,7 +1875,7 @@ impl VibesCore {
         std::thread::spawn(move || {
             for item in items {
                 let fid = item.id.clone();
-                let res = run_retry_failed_item(&item, &albums_dir, format, cookies)
+                let res = run_retry_failed_item(&item, &albums_dir, format, cookies.as_deref())
                     .map_err(|e| format!("{e}"));
                 let _ = tx.send_blocking(CoreBgEvent::FailedItemRetried { id: fid, res });
             }
@@ -2495,7 +2496,7 @@ impl VibesCore {
         self.persist_config();
         self.stream_url_cache.clear();
         if let Some(ref mpv) = self.mpv {
-            let _ = mpv.set_ytdl_cookies(src.ytdlp_arg());
+            let _ = mpv.set_ytdl_cookies(src.ytdlp_arg().as_deref());
         }
         self.show_toast(
             if src == YoutubeCookiesSource::None {
@@ -2736,7 +2737,7 @@ impl VibesCore {
 
         std::thread::spawn(move || {
             let (status, failures) =
-                run_artist_sync(&albums_dir, format, cookies, &next, cancel, |st| {
+                run_artist_sync(&albums_dir, format, cookies.as_deref(), &next, cancel, |st| {
                     let _ = tx.send_blocking(CoreBgEvent::ArtistSyncProgress(st));
                 });
             let _ = tx.send_blocking(CoreBgEvent::ArtistSyncFinished {
@@ -2969,7 +2970,7 @@ impl VibesCore {
                 &albums_dir,
                 mode,
                 format,
-                cookies,
+                cookies.as_deref(),
                 &details,
                 clean_editions,
                 |st| {
@@ -3148,7 +3149,9 @@ impl VibesCore {
             }
             MpvEvent::Error(msg) => {
                 crate::log::log_error("mpv", &msg);
-                let is_generic = msg == "loading failed" || msg == "unrecognized file format";
+                let is_generic = msg == "loading failed"
+                    || msg == "unrecognized file format"
+                    || msg.starts_with("youtube-dl failed");
                 let has_yt_detail = self
                     .toast
                     .as_deref()

@@ -468,6 +468,10 @@ pub fn write_tags_and_cover(
     Ok(())
 }
 
+pub fn is_yt_auth_gate_error(err: &str) -> bool {
+    err.contains("Sign in to confirm") || err.contains("cookies-from-browser")
+}
+
 /// Retries `extract_ytdlp_audio` once after a short backoff and removes partial leftovers on failure.
 pub fn extract_ytdlp_audio_with_retry(
     url: &str,
@@ -488,7 +492,7 @@ pub fn extract_ytdlp_audio_with_retry(
         Ok(p) => Ok(p),
         Err(first_err) => {
             let err_txt = format!("{first_err}");
-            if err_txt.contains("Sign in to confirm") || err_txt.contains("cookies-from-browser") {
+            if is_yt_auth_gate_error(&err_txt) {
                 return Err(first_err);
             }
             std::thread::sleep(std::time::Duration::from_millis(1500));

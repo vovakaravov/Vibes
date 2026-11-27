@@ -771,11 +771,15 @@ pub fn run_artist_sync(
     let mut all_failures = Vec::new();
     let lyrics_agent = crate::lyrics::new_http_agent();
 
+    let mut auth_blocked = false;
     for (rel_idx, rel) in clean_albums
         .into_iter()
         .chain(clean_singles.into_iter())
         .enumerate()
     {
+        if auth_blocked {
+            break;
+        }
         if cancel.load(Ordering::Acquire) {
             let st = ArtistSyncStatus::Cancelled {
                 artist: disco.artist.name.clone(),
@@ -929,6 +933,7 @@ pub fn run_artist_sync(
                         total_saved += 1;
                     }
                     Err(err) => {
+                        let err_str = format!("{err}");
                         all_failures.push(FailedDownloadItem {
                             id: format!("trk-{}", tr.video_id),
                             kind: FailedDownloadKind::ArtistSync,
@@ -938,9 +943,17 @@ pub fn run_artist_sync(
                             track_number: None,
                             url: Some(tr.url.clone()),
                             dest_dir: singles_dir.clone(),
-                            error: format!("{err}"),
+                            error: err_str.clone(),
                             failed_at: format_failed_at(),
                         });
+                        if crate::downloader::is_yt_auth_gate_error(&err_str) {
+                            crate::log::log_warn(
+                                "discography",
+                                "Stopping artist sync early: YouTube requested sign-in",
+                            );
+                            auth_blocked = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -981,6 +994,12 @@ pub fn run_artist_sync(
             {
                 total_saved += saved;
                 total_skipped += skipped;
+            }
+            if failures
+                .iter()
+                .any(|f| crate::downloader::is_yt_auth_gate_error(&f.error))
+            {
+                auth_blocked = true;
             }
             all_failures.extend(failures);
         }
