@@ -1176,6 +1176,7 @@ pub fn render_settings_view(
     let core_lyr_backfill = win.core.clone();
     let core_clean_ed = win.core.clone();
     let core_reorg = win.core.clone();
+    let core_log = win.core.clone();
     let reorg_running = win.core.read(cx).reorg_running;
     let backfill_active = backfill.active;
     let backfill_text = if backfill_active || backfill.processed > 0 {
@@ -1486,16 +1487,31 @@ pub fn render_settings_view(
                         ),
                 )
                 .child(
-                    div()
+                    h_flex()
                         .pt_1()
                         .border_t_1()
                         .border_color(hsla(pal.border_subtle))
-                        .text_size(px(11.))
-                        .text_color(hsla(pal.fg_muted))
-                        .child(format!(
-                            "Active theme background: #{:06x} · KDE tray protocol: org.kde.StatusNotifierItem (ksni)",
-                            pal.bg_main
-                        )),
+                        .justify_between()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(hsla(pal.fg_muted))
+                                .child(format!(
+                                    "Active theme background: #{:06x} · KDE tray protocol: org.kde.StatusNotifierItem (ksni)",
+                                    pal.bg_main
+                                )),
+                        )
+                        .child(
+                            Button::new("settings-open-log")
+                                .ghost()
+                                .xsmall()
+                                .label("Open vibes.log")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_log.read(cx).open_log_file();
+                                })),
+                        ),
                 ),
         )
         .child(

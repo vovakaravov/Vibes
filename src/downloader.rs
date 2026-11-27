@@ -982,7 +982,9 @@ pub fn run_save_song(
                 radio_name,
                 &chosen_url,
             ) {
-                eprintln!("Vibes metadata warning for {}: {err}", staged_audio.display());
+                let msg = format!("Metadata warning for {}: {err}", staged_audio.display());
+                crate::log::log_warn("downloader", &msg);
+                eprintln!("Vibes {msg}");
             }
 
             match move_audio_file(&staged_audio, &final_path) {

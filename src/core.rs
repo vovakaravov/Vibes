@@ -1916,14 +1916,22 @@ impl VibesCore {
         };
         if self.window_open {
             cx.write_to_clipboard(ClipboardItem::new_string(txt.clone()));
-        } else if let Ok(mut child) = Command::new("wl-copy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            let _ = stdin.write_all(txt.as_bytes());
+        } else {
+            match Command::new("wl-copy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(txt.as_bytes());
+                    }
+                }
+                Err(err) => {
+                    crate::log::log_warn("clipboard", &format!("wl-copy spawn failed: {err}"));
+                }
+            }
         }
         self.show_toast(format!("Copied: {txt}"), cx);
     }
@@ -2503,6 +2511,17 @@ impl VibesCore {
     pub fn open_folder(&self, path: &std::path::Path) {
         let _ = std::fs::create_dir_all(path);
         let _ = Command::new("xdg-open").arg(path).spawn();
+    }
+
+    pub fn open_log_file(&self) {
+        let log_path = crate::log::log_file_path();
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !log_path.exists() {
+            crate::log::log_info("vibes", "Diagnostic log initialized");
+        }
+        let _ = Command::new("xdg-open").arg(&log_path).spawn();
     }
 
     pub fn set_albums_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
@@ -3128,6 +3147,7 @@ impl VibesCore {
                 dirty_ui = true;
             }
             MpvEvent::Error(msg) => {
+                crate::log::log_error("mpv", &msg);
                 let is_generic = msg == "loading failed" || msg == "unrecognized file format";
                 let has_yt_detail = self
                     .toast
@@ -3136,6 +3156,17 @@ impl VibesCore {
                 if !(is_generic && has_yt_detail) {
                     self.show_toast(format!("Stream error: {msg}"), cx);
                 }
+            }
+            MpvEvent::Log {
+                level,
+                prefix,
+                text,
+            } => {
+                crate::log::write_log_line(
+                    &level.to_ascii_uppercase(),
+                    &format!("mpv/{prefix}"),
+                    &text,
+                );
             }
             MpvEvent::EndFile { reason } => {
                 // `loadfile ... replace` and playlist redirects emit `stop`/`redirect` for the old entry
@@ -3613,12 +3644,20 @@ impl VibesCore {
             }
             CoreBgEvent::StreamUrlPrefetched { video_id, res } => {
                 self.prefetching_video_ids.remove(&video_id);
-                if let Ok(cdn_url) = res {
-                    if self.stream_url_cache.len() >= 32 {
-                        self.stream_url_cache.clear();
+                match res {
+                    Ok(cdn_url) => {
+                        if self.stream_url_cache.len() >= 32 {
+                            self.stream_url_cache.clear();
+                        }
+                        self.stream_url_cache
+                            .insert(video_id, (cdn_url, Instant::now()));
                     }
-                    self.stream_url_cache
-                        .insert(video_id, (cdn_url, Instant::now()));
+                    Err(err) => {
+                        crate::log::log_warn(
+                            "prefetch",
+                            &format!("Stream prefetch failed for {video_id}: {err}"),
+                        );
+                    }
                 }
             }
             CoreBgEvent::LocalLibraryScanned { gen_id, snapshot } => {

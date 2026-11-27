@@ -254,11 +254,16 @@ impl VisualizerController {
         if want_filter && !self.filter_attached {
             if let Some(mpv) = mpv
                 && let Some(fifo) = self.ensure_reader()
-                && mpv
-                    .set_audio_filter_label(&build_mpv_af_spec(&fifo))
-                    .is_ok()
             {
-                self.filter_attached = true;
+                match mpv.set_audio_filter_label(&build_mpv_af_spec(&fifo)) {
+                    Ok(()) => self.filter_attached = true,
+                    Err(err) => {
+                        crate::log::log_warn(
+                            "visualizer",
+                            &format!("Failed to attach mpv lavfi filter: {err}"),
+                        );
+                    }
+                }
             }
         } else if !want_filter && self.filter_attached {
             if let Some(mpv) = mpv {

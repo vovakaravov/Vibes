@@ -33,6 +33,11 @@ pub enum MpvEvent {
         reason: String,
     },
     Error(String),
+    Log {
+        level: String,
+        prefix: String,
+        text: String,
+    },
 }
 
 /// Parses one JSON line emitted by `mpv`'s `--input-ipc-server` socket.
@@ -41,6 +46,20 @@ pub fn parse_mpv_ipc_line(line: &str) -> Vec<MpvEvent> {
         return Vec::new();
     };
     let Some(ev_name) = val.get("event").and_then(|v| v.as_str()) else {
+        if let Some(err) = val.get("error").and_then(|v| v.as_str())
+            && err != "success"
+        {
+            let req_id = val.get("request_id").and_then(|v| v.as_u64());
+            let text = match req_id {
+                Some(id) => format!("IPC command #{id} failed: {err}"),
+                None => format!("IPC command failed: {err}"),
+            };
+            return vec![MpvEvent::Log {
+                level: "error".to_string(),
+                prefix: "mpv-ipc".to_string(),
+                text,
+            }];
+        }
         return Vec::new();
     };
 
@@ -165,6 +184,21 @@ pub fn parse_mpv_ipc_line(line: &str) -> Vec<MpvEvent> {
             }
             events.push(MpvEvent::EndFile { reason });
         }
+        "log-message" => {
+            let prefix = val.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+            let level = val.get("level").and_then(|v| v.as_str()).unwrap_or("");
+            let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if !text.is_empty() {
+                events.push(MpvEvent::Log {
+                    level: level.to_string(),
+                    prefix: prefix.to_string(),
+                    text: text.to_string(),
+                });
+                if let Some(msg) = parse_mpv_log_message(prefix, level, text) {
+                    events.push(MpvEvent::Error(msg));
+                }
+            }
+        }
         _ => {}
     }
     events
@@ -182,6 +216,9 @@ pub struct ResolvedYoutubeStream {
     pub url: String,
     pub available_at: Option<SystemTime>,
 }
+
+pub const YTDL_AUDIO_FORMAT: &str =
+    "bestaudio[protocol^=m3u8]/234/bestaudio[ext=webm]/bestaudio/best";
 
 pub fn format_ytdl_raw_options(cookies_browser: Option<&str>) -> String {
     match cookies_browser.map(str::trim).filter(|b| !b.is_empty()) {
@@ -207,7 +244,7 @@ pub fn build_mpv_args(
         "--force-window=no".to_string(),
         "--keep-open=no".to_string(),
         "--ytdl=yes".to_string(),
-        "--ytdl-format=bestaudio[ext=webm]/bestaudio/best".to_string(),
+        format!("--ytdl-format={YTDL_AUDIO_FORMAT}"),
         format!("--ytdl-raw-options={}", format_ytdl_raw_options(cookies_browser)),
         "--script-opts=ytdl_hook-all_formats=no".to_string(),
         "--cache=yes".to_string(),
@@ -243,8 +280,8 @@ pub fn parse_ytdlp_stream_json(raw: &str) -> Result<ResolvedYoutubeStream> {
     Ok(ResolvedYoutubeStream { url, available_at })
 }
 
-pub fn parse_mpv_stderr_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
+pub fn parse_mpv_log_message(prefix: &str, level: &str, text: &str) -> Option<String> {
+    let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -258,11 +295,20 @@ pub fn parse_mpv_stderr_line(line: &str) -> Option<String> {
     if lower.contains("http error 403") {
         return Some("YouTube returned HTTP 403 for this stream".to_string());
     }
-    if let Some((_, rest)) = trimmed.split_once("[ytdl_hook] ERROR:") {
-        let msg = rest.trim();
-        if !msg.is_empty() {
-            return Some(msg.to_string());
-        }
+    if !matches!(level, "error" | "fatal") {
+        return None;
+    }
+    if prefix == "ytdl_hook" {
+        return Some(trimmed.to_string());
+    }
+    if prefix.starts_with("ao") {
+        return Some(format!("Audio output error ({prefix}): {trimmed}"));
+    }
+    if matches!(prefix, "lavfi" | "af") {
+        return Some(format!("Audio filter error: {trimmed}"));
+    }
+    if matches!(prefix, "ffmpeg" | "curl" | "stream" | "tls") {
+        return Some(format!("Stream error ({prefix}): {trimmed}"));
     }
     None
 }
@@ -275,7 +321,7 @@ pub fn resolve_youtube_audio_stream(
     let mut cmd = Command::new("yt-dlp");
     cmd.args([
         "-f",
-        "bestaudio[ext=webm]/bestaudio/best",
+        YTDL_AUDIO_FORMAT,
         "-j",
         "--no-playlist",
         "--no-warnings",
@@ -305,31 +351,13 @@ impl MpvController {
         let _ = fs::remove_file(&socket_path);
 
         let args = build_mpv_args(initial_volume, &socket_path, cookies_browser);
-        let mut child = Command::new("mpv")
+        let child = Command::new("mpv")
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .context("Failed to spawn `mpv` daemon")?;
-
-        if let Some(stderr) = child.stderr.take() {
-            let err_tx = event_tx.clone();
-            thread::Builder::new()
-                .name("vibes-mpv-stderr".into())
-                .spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line_res in reader.lines() {
-                        let Ok(line) = line_res else {
-                            break;
-                        };
-                        if let Some(msg) = parse_mpv_stderr_line(&line) {
-                            let _ = err_tx.send_blocking(MpvEvent::Error(msg));
-                        }
-                    }
-                })
-                .ok();
-        }
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let stream = loop {
@@ -393,6 +421,9 @@ impl MpvController {
                 "command": ["observe_property", obs_id, *prop]
             }))?;
         }
+        self.send_cmd(json!({
+            "command": ["request_log_messages", "warn"]
+        }))?;
         Ok(())
     }
 
@@ -549,6 +580,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--cache-pause-initial=no"));
         assert!(args.iter().any(|a| a == "--demuxer-readahead-secs=10"));
         assert!(!args.iter().any(|a| a.contains("android_vr")));
+        assert!(args.iter().any(|a| a == &format!("--ytdl-format={YTDL_AUDIO_FORMAT}")));
         assert!(args.iter().any(|a| a == "--ytdl-raw-options=no-playlist="));
         assert!(args.iter().any(|a| a == "--script-opts=ytdl_hook-all_formats=no"));
         assert!(args.iter().any(|a| a == "--audio-display=no"));
@@ -566,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_ytdlp_stream_json_and_stderr_messages() {
+    fn parses_ytdlp_stream_json_and_ipc_log_messages() {
         let json_str = r#"{"url":"https://example.com/audio.webm","available_at":1795752475}"#;
         let resolved = parse_ytdlp_stream_json(json_str).unwrap();
         assert_eq!(resolved.url, "https://example.com/audio.webm");
@@ -575,16 +607,83 @@ mod tests {
             Some(UNIX_EPOCH + Duration::from_secs(1795752476))
         );
 
-        let sign_in = parse_mpv_stderr_line(
-            "[ytdl_hook] ERROR: [youtube] xyz: Sign in to confirm you're not a bot.",
-        )
-        .unwrap();
-        assert!(sign_in.contains("Settings"));
+        let sign_in_ipc = r#"{"event":"log-message","prefix":"ytdl_hook","level":"error","text":"ERROR: [youtube] xyz: Sign in to confirm you're not a bot.\n"}"#;
+        let evs = parse_mpv_ipc_line(sign_in_ipc);
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(&evs[0], MpvEvent::Log { level, prefix, .. } if level == "error" && prefix == "ytdl_hook"));
+        match &evs[1] {
+            MpvEvent::Error(msg) => assert!(msg.contains("Settings")),
+            other => panic!("Expected Error event, got {other:?}"),
+        }
 
+        let err_403_ipc =
+            r#"{"event":"log-message","prefix":"curl","level":"error","text":"HTTP error 403"}"#;
         assert_eq!(
-            parse_mpv_stderr_line("[curl] HTTP error 403"),
-            Some("YouTube returned HTTP 403 for this stream".to_string())
+            parse_mpv_ipc_line(err_403_ipc),
+            vec![
+                MpvEvent::Log {
+                    level: "error".to_string(),
+                    prefix: "curl".to_string(),
+                    text: "HTTP error 403".to_string(),
+                },
+                MpvEvent::Error("YouTube returned HTTP 403 for this stream".to_string()),
+            ]
         );
-        assert_eq!(parse_mpv_stderr_line("AO: [pulse] 48000Hz"), None);
+
+        let ytdl_err_ipc = r#"{"event":"log-message","prefix":"ytdl_hook","level":"fatal","text":"Video unavailable"}"#;
+        assert_eq!(
+            parse_mpv_ipc_line(ytdl_err_ipc),
+            vec![
+                MpvEvent::Log {
+                    level: "fatal".to_string(),
+                    prefix: "ytdl_hook".to_string(),
+                    text: "Video unavailable".to_string(),
+                },
+                MpvEvent::Error("Video unavailable".to_string()),
+            ]
+        );
+
+        let ao_err_ipc = r#"{"event":"log-message","prefix":"ao/pipewire","level":"error","text":"device disconnected"}"#;
+        assert!(
+            parse_mpv_ipc_line(ao_err_ipc).contains(&MpvEvent::Error(
+                "Audio output error (ao/pipewire): device disconnected".to_string()
+            ))
+        );
+
+        let lavfi_err_ipc = r#"{"event":"log-message","prefix":"lavfi","level":"error","text":"filter init failed"}"#;
+        assert!(
+            parse_mpv_ipc_line(lavfi_err_ipc).contains(&MpvEvent::Error(
+                "Audio filter error: filter init failed".to_string()
+            ))
+        );
+
+        let ffmpeg_err_ipc = r#"{"event":"log-message","prefix":"ffmpeg","level":"error","text":"Connection timed out"}"#;
+        assert!(
+            parse_mpv_ipc_line(ffmpeg_err_ipc).contains(&MpvEvent::Error(
+                "Stream error (ffmpeg): Connection timed out".to_string()
+            ))
+        );
+
+        let ignored_info_ipc =
+            r#"{"event":"log-message","prefix":"ao/pulse","level":"info","text":"48000Hz"}"#;
+        assert_eq!(
+            parse_mpv_ipc_line(ignored_info_ipc),
+            vec![MpvEvent::Log {
+                level: "info".to_string(),
+                prefix: "ao/pulse".to_string(),
+                text: "48000Hz".to_string(),
+            }]
+        );
+
+        let ipc_reply_err = r#"{"request_id":9,"error":"invalid parameter"}"#;
+        assert_eq!(
+            parse_mpv_ipc_line(ipc_reply_err),
+            vec![MpvEvent::Log {
+                level: "error".to_string(),
+                prefix: "mpv-ipc".to_string(),
+                text: "IPC command #9 failed: invalid parameter".to_string(),
+            }]
+        );
+        assert!(parse_mpv_ipc_line(r#"{"request_id":9,"error":"success"}"#).is_empty());
     }
 }

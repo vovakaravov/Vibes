@@ -722,7 +722,9 @@ impl TrayController {
         let handle = match tray.assume_sni_available(true).spawn() {
             Ok(h) => Some(h),
             Err(err) => {
-                eprintln!("Vibes tray warning: {err}");
+                let msg = format!("Tray warning: {err}");
+                crate::log::log_warn("tray", &msg);
+                eprintln!("Vibes {msg}");
                 None
             }
         };

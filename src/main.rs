@@ -6,6 +6,7 @@ mod discography;
 mod downloader;
 mod instance;
 mod local_library;
+mod log;
 mod lyrics;
 mod lyrics_overlay;
 mod mpris;
@@ -101,6 +102,8 @@ fn main() {
     if instance::notify_existing_instance() {
         return;
     }
+
+    log::log_info("vibes", "Vibes started");
 
     gpui_kit::application()
         .with_quit_mode(QuitMode::Explicit)

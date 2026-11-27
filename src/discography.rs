@@ -801,7 +801,9 @@ pub fn run_artist_sync(
         let details = match fetch_album_details(&rel) {
             Ok(d) => d,
             Err(err) => {
-                eprintln!("Vibes artist sync release fetch failed ({}): {err}", rel.title);
+                let msg = format!("Artist sync release fetch failed ({}): {err}", rel.title);
+                crate::log::log_warn("discography", &msg);
+                eprintln!("Vibes {msg}");
                 all_failures.push(FailedDownloadItem {
                     id: format!("rel-{}", rel.browse_id),
                     kind: FailedDownloadKind::ArtistSync,

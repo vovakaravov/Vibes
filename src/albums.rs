@@ -705,15 +705,16 @@ pub fn download_album_tracks_with_failures(
                     cover_jpg.as_deref(),
                     fetched_lyrics,
                 ) {
-                    eprintln!("Vibes album tag warning on {}: {err}", actual_path.display());
+                    let msg = format!("Album tag warning on {}: {err}", actual_path.display());
+                    crate::log::log_warn("albums", &msg);
+                    eprintln!("Vibes {msg}");
                 }
                 saved += 1;
             }
             Err(err) => {
-                eprintln!(
-                    "Vibes album track download failed ({}): {err}",
-                    track.title
-                );
+                let msg = format!("Album track download failed ({}): {err}", track.title);
+                crate::log::log_warn("albums", &msg);
+                eprintln!("Vibes {msg}");
                 failures.push(FailedDownloadItem {
                     id: format!("alb-{}-{}", track.video_id, clean_name),
                     kind: FailedDownloadKind::AlbumTrack,

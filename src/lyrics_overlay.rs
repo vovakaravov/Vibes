@@ -607,7 +607,9 @@ impl WaylandSession {
         event_queue.roundtrip(&mut state).ok()?;
 
         if state.compositor.is_none() || state.shm.is_none() || state.layer_shell.is_none() {
-            eprintln!("Vibes overlay warning: compositor lacks zwlr_layer_shell_v1 or wl_shm");
+            let msg = "Compositor lacks zwlr_layer_shell_v1 or wl_shm";
+            crate::log::log_warn("overlay", msg);
+            eprintln!("Vibes overlay warning: {msg}");
             return None;
         }
 
