@@ -87,7 +87,7 @@ impl VibesWindow {
         });
         let yt_search_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search YouTube Music, mixes, podcasts, or paste a URL (Enter)…")
+                .placeholder("Search any song, artist, mix, podcast, or paste a YouTube URL (Enter)…")
                 .default_value(initial_yt_q)
         });
         let album_search_input = cx.new(|cx| {

@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MpvEvent {
@@ -177,7 +177,24 @@ pub struct MpvController {
     next_id: AtomicU64,
 }
 
-pub fn build_mpv_args(initial_volume: f64, socket_path: &Path) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedYoutubeStream {
+    pub url: String,
+    pub available_at: Option<SystemTime>,
+}
+
+pub fn format_ytdl_raw_options(cookies_browser: Option<&str>) -> String {
+    match cookies_browser.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(browser) => format!("no-playlist=,cookies-from-browser={browser}"),
+        None => "no-playlist=".to_string(),
+    }
+}
+
+pub fn build_mpv_args(
+    initial_volume: f64,
+    socket_path: &Path,
+    cookies_browser: Option<&str>,
+) -> Vec<String> {
     vec![
         "--no-config".to_string(),
         "--no-video".to_string(),
@@ -191,7 +208,8 @@ pub fn build_mpv_args(initial_volume: f64, socket_path: &Path) -> Vec<String> {
         "--keep-open=no".to_string(),
         "--ytdl=yes".to_string(),
         "--ytdl-format=bestaudio[ext=webm]/bestaudio/best".to_string(),
-        "--ytdl-raw-options=no-playlist=,extractor-args=youtube:player_client=android_vr".to_string(),
+        format!("--ytdl-raw-options={}", format_ytdl_raw_options(cookies_browser)),
+        "--script-opts=ytdl_hook-all_formats=no".to_string(),
         "--cache=yes".to_string(),
         "--cache-pause-initial=no".to_string(),
         "--cache-pause-wait=0.5".to_string(),
@@ -205,62 +223,113 @@ pub fn build_mpv_args(initial_volume: f64, socket_path: &Path) -> Vec<String> {
     ]
 }
 
-/// Resolves a direct audio stream CDN URL via `yt-dlp -g` (~1.5s with `android_vr`) so `mpv` can start streaming immediately.
-pub fn resolve_youtube_audio_stream_url(url: &str) -> Result<String> {
-    let attempts: [&[&str]; 2] = [
-        &[
-            "-f",
-            "bestaudio[ext=webm]/bestaudio/best",
-            "-g",
-            "--no-playlist",
-            "--no-warnings",
-            "--extractor-args",
-            "youtube:player_client=android_vr",
-            url,
-        ],
-        &[
-            "-f",
-            "bestaudio[ext=webm]/bestaudio/best",
-            "-g",
-            "--no-playlist",
-            "--no-warnings",
-            url,
-        ],
-    ];
-    for args in attempts {
-        if let Ok(out) = Command::new("yt-dlp").args(args).output()
-            && out.status.success()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if let Some(first_http) = text
-                .lines()
-                .map(str::trim)
-                .find(|l| l.starts_with("http://") || l.starts_with("https://"))
-            {
-                return Ok(first_http.to_string());
-            }
+pub fn parse_ytdlp_stream_json(raw: &str) -> Result<ResolvedYoutubeStream> {
+    let val: Value =
+        serde_json::from_str(raw.trim()).context("Invalid JSON returned by yt-dlp -j")?;
+    let url = val
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .ok_or_else(|| anyhow::anyhow!("Missing direct HTTP stream URL in yt-dlp output"))?
+        .to_string();
+
+    let available_at = val
+        .get("available_at")
+        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.ceil() as u64)))
+        .filter(|&ts| ts > 0)
+        .map(|ts| UNIX_EPOCH + Duration::from_secs(ts + 1));
+
+    Ok(ResolvedYoutubeStream { url, available_at })
+}
+
+pub fn parse_mpv_stderr_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("sign in to confirm") {
+        return Some(
+            "YouTube requires sign-in on this IP — pick your browser in Settings → YouTube Auth Cookies, or wait for rate limit to clear"
+                .to_string(),
+        );
+    }
+    if lower.contains("http error 403") {
+        return Some("YouTube returned HTTP 403 for this stream".to_string());
+    }
+    if let Some((_, rest)) = trimmed.split_once("[ytdl_hook] ERROR:") {
+        let msg = rest.trim();
+        if !msg.is_empty() {
+            return Some(msg.to_string());
         }
     }
-    anyhow::bail!("Could not resolve direct audio URL for {url}")
+    None
+}
+
+/// Resolves a direct audio stream CDN URL and its `available_at` timestamp via `yt-dlp -j`.
+pub fn resolve_youtube_audio_stream(
+    url: &str,
+    cookies_browser: Option<&str>,
+) -> Result<ResolvedYoutubeStream> {
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "-f",
+        "bestaudio[ext=webm]/bestaudio/best",
+        "-j",
+        "--no-playlist",
+        "--no-warnings",
+    ]);
+    if let Some(browser) = cookies_browser.map(str::trim).filter(|b| !b.is_empty()) {
+        cmd.args(["--cookies-from-browser", browser]);
+    }
+    cmd.arg(url);
+    let out = cmd.output().context("Failed to execute `yt-dlp`")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err.lines().last().unwrap_or("yt-dlp failed to resolve URL");
+        anyhow::bail!("{}", msg.trim());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_ytdlp_stream_json(&stdout)
 }
 
 impl MpvController {
     pub fn spawn(
         initial_volume: f64,
+        cookies_browser: Option<&str>,
         event_tx: async_channel::Sender<MpvEvent>,
     ) -> Result<Self> {
         let uid_or_tmp = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
         let socket_path = uid_or_tmp.join(format!("vibes-mpv-{}.sock", std::process::id()));
         let _ = fs::remove_file(&socket_path);
 
-        let args = build_mpv_args(initial_volume, &socket_path);
-        let child = Command::new("mpv")
+        let args = build_mpv_args(initial_volume, &socket_path, cookies_browser);
+        let mut child = Command::new("mpv")
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context("Failed to spawn `mpv` daemon")?;
+
+        if let Some(stderr) = child.stderr.take() {
+            let err_tx = event_tx.clone();
+            thread::Builder::new()
+                .name("vibes-mpv-stderr".into())
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line_res in reader.lines() {
+                        let Ok(line) = line_res else {
+                            break;
+                        };
+                        if let Some(msg) = parse_mpv_stderr_line(&line) {
+                            let _ = err_tx.send_blocking(MpvEvent::Error(msg));
+                        }
+                    }
+                })
+                .ok();
+        }
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let stream = loop {
@@ -400,6 +469,12 @@ impl MpvController {
         self.send_cmd(json!({ "command": ["af", "remove", label] }))
     }
 
+    pub fn set_ytdl_cookies(&self, cookies_browser: Option<&str>) -> Result<()> {
+        self.send_cmd(json!({
+            "command": ["set_property", "ytdl-raw-options", format_ytdl_raw_options(cookies_browser)]
+        }))
+    }
+
     pub fn shutdown(&self) {
         let _ = self.send_cmd(json!({ "command": ["quit"] }));
         *self.writer.lock().unwrap() = None;
@@ -468,16 +543,48 @@ mod tests {
 
     #[test]
     fn mpv_args_cap_demuxer_cache_and_preserve_ytdl() {
-        let args = build_mpv_args(72.0, Path::new("/tmp/vibes-test.sock"));
+        let args = build_mpv_args(72.0, Path::new("/tmp/vibes-test.sock"), None);
         assert!(args.iter().any(|a| a == "--demuxer-max-bytes=16MiB"));
         assert!(args.iter().any(|a| a == "--demuxer-max-back-bytes=8MiB"));
         assert!(args.iter().any(|a| a == "--cache-pause-initial=no"));
         assert!(args.iter().any(|a| a == "--demuxer-readahead-secs=10"));
-        assert!(args.iter().any(|a| a.contains("player_client=android_vr")));
+        assert!(!args.iter().any(|a| a.contains("android_vr")));
+        assert!(args.iter().any(|a| a == "--ytdl-raw-options=no-playlist="));
+        assert!(args.iter().any(|a| a == "--script-opts=ytdl_hook-all_formats=no"));
         assert!(args.iter().any(|a| a == "--audio-display=no"));
         assert!(args.iter().any(|a| a == "--ytdl=yes"));
         assert!(args.iter().any(|a| a == "--load-scripts=no"));
         assert!(args.iter().any(|a| a == "--volume=72"));
         assert!(args.iter().any(|a| a == "--input-ipc-server=/tmp/vibes-test.sock"));
+
+        let args_cookie = build_mpv_args(50.0, Path::new("/tmp/vibes-test.sock"), Some("firefox"));
+        assert!(
+            args_cookie
+                .iter()
+                .any(|a| a == "--ytdl-raw-options=no-playlist=,cookies-from-browser=firefox")
+        );
+    }
+
+    #[test]
+    fn parses_ytdlp_stream_json_and_stderr_messages() {
+        let json_str = r#"{"url":"https://example.com/audio.webm","available_at":1795752475}"#;
+        let resolved = parse_ytdlp_stream_json(json_str).unwrap();
+        assert_eq!(resolved.url, "https://example.com/audio.webm");
+        assert_eq!(
+            resolved.available_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1795752476))
+        );
+
+        let sign_in = parse_mpv_stderr_line(
+            "[ytdl_hook] ERROR: [youtube] xyz: Sign in to confirm you're not a bot.",
+        )
+        .unwrap();
+        assert!(sign_in.contains("Settings"));
+
+        assert_eq!(
+            parse_mpv_stderr_line("[curl] HTTP error 403"),
+            Some("YouTube returned HTTP 403 for this stream".to_string())
+        );
+        assert_eq!(parse_mpv_stderr_line("AO: [pulse] 48000Hz"), None);
     }
 }

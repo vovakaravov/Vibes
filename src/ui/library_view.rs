@@ -1437,6 +1437,59 @@ pub fn render_settings_view(
                         .pt_1()
                         .border_t_1()
                         .border_color(hsla(pal.border_subtle))
+                        .child(
+                            v_flex()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hsla(pal.fg))
+                                        .child("YouTube Auth Cookies (yt-dlp --cookies-from-browser)"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(hsla(pal.fg_muted))
+                                        .child("Optional: use a signed-in browser session for streaming & downloads if YouTube asks to confirm you're not a bot."),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_1p5()
+                                        .children(
+                                            crate::config::YoutubeCookiesSource::ALL
+                                                .into_iter()
+                                                .map(|src| {
+                                                    let active = src == cfg.yt_cookies_browser;
+                                                    let core_ent = win.core.clone();
+                                                    Button::new(SharedString::from(format!(
+                                                        "yt-ck-{}",
+                                                        src.label()
+                                                    )))
+                                                    .with_variant(if active {
+                                                        ButtonVariant::Primary
+                                                    } else {
+                                                        ButtonVariant::Secondary
+                                                    })
+                                                    .xsmall()
+                                                    .label(src.label())
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        core_ent.update(cx, |c, cx| {
+                                                            c.set_yt_cookies_browser(src, cx)
+                                                        });
+                                                    }))
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(hsla(pal.border_subtle))
                         .text_size(px(11.))
                         .text_color(hsla(pal.fg_muted))
                         .child(format!(

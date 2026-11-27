@@ -61,7 +61,7 @@ pub fn render_youtube_view(
                                 .text_base()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(hsla(pal.fg))
-                                .child("YouTube Audio-Only"),
+                                .child("Songs & Streams"),
                         )
                         .child(
                             div()
@@ -178,7 +178,7 @@ pub fn render_youtube_view(
                             .p_6()
                             .text_xs()
                             .text_color(hsla(pal.fg_muted))
-                            .child("Search for music mixes, podcasts, or paste any YouTube link to stream audio-only via mpv."),
+                            .child("Search any individual song, artist, mix, or podcast — or paste a YouTube URL to stream audio-only or save locally."),
                     )
                 })
                 .children(filtered.into_iter().enumerate().map(|(ix, (item, thumb_path))| {

@@ -10,7 +10,7 @@ pub use crate::config::QueueItem;
 use crate::config::{
     AlbumFolderMode, FailedDownloadItem, FailedDownloadKind, FollowedArtist, PlayTarget,
     RepeatMode, SaveAudioFormat, SaveFolderMode, SongLogEntry, UserPlaylist, VibesConfig,
-    VibesState,
+    VibesState, YoutubeCookiesSource,
 };
 use crate::discography::{
     ArtistDiscography, ArtistSummary, ArtistSyncStatus, fetch_artist_discography,
@@ -32,7 +32,7 @@ use crate::lyrics::{
 };
 use crate::lyrics_overlay::{LyricsOverlayController, OverlayFrame};
 use crate::mpris::{MprisAction, MprisController, MprisSnapshot};
-use crate::mpv::{MpvController, MpvEvent, resolve_youtube_audio_stream_url};
+use crate::mpv::{MpvController, MpvEvent, ResolvedYoutubeStream, resolve_youtube_audio_stream};
 use crate::radio::{
     RadioBrowserClient, RadioStation, load_cached_stations, save_cached_stations,
 };
@@ -78,7 +78,7 @@ impl DiscoverTab {
         match self {
             Self::Artists => "Artists",
             Self::Albums => "Albums",
-            Self::Tracks => "Tracks & Streams",
+            Self::Tracks => "Songs & Streams",
         }
     }
 }
@@ -189,7 +189,7 @@ enum CoreBgEvent {
     ReorgCompleted(Result<ReorgReport, String>),
     StreamUrlPrefetched {
         video_id: String,
-        res: Result<String, String>,
+        res: Result<ResolvedYoutubeStream, String>,
     },
     LocalLibraryScanned {
         gen_id: u64,
@@ -272,9 +272,11 @@ pub struct VibesCore {
     pub selected_playlist_id: Option<String>,
     pub reorg_running: bool,
 
-    // Stream prefetch cache (video_id -> (cdn_url, fetched_at))
-    stream_url_cache: HashMap<String, (String, Instant)>,
+    // Stream prefetch cache (video_id -> (resolved stream, fetched_at))
+    stream_url_cache: HashMap<String, (ResolvedYoutubeStream, Instant)>,
     prefetching_video_ids: HashSet<String>,
+    current_used_cached_stream: bool,
+    yt_stream_retried: bool,
 
     // Playback state
     pub current_target: Option<PlayTarget>,
@@ -349,7 +351,11 @@ impl VibesCore {
         let (show_tx, show_rx) = async_channel::unbounded();
         let (bg_tx, bg_rx) = async_channel::unbounded();
 
-        let (mpv, mpv_error) = match MpvController::spawn(config.volume, mpv_tx) {
+        let (mpv, mpv_error) = match MpvController::spawn(
+            config.volume,
+            config.yt_cookies_browser.ytdlp_arg(),
+            mpv_tx,
+        ) {
             Ok(c) => (Some(c), None),
             Err(err) => (None, Some(format!("{err}"))),
         };
@@ -502,6 +508,8 @@ impl VibesCore {
 
             stream_url_cache: HashMap::new(),
             prefetching_video_ids: HashSet::new(),
+            current_used_cached_stream: false,
+            yt_stream_retried: false,
 
             current_target,
             playing: false,
@@ -1135,9 +1143,10 @@ impl VibesCore {
             return;
         }
         let tx = self.bg_tx.clone();
+        let cookies = self.config.yt_cookies_browser.ytdlp_arg();
         let _ = cx;
         std::thread::spawn(move || {
-            let res = resolve_youtube_audio_stream_url(&url).map_err(|e| format!("{e}"));
+            let res = resolve_youtube_audio_stream(&url, cookies).map_err(|e| format!("{e}"));
             let _ = tx.send_blocking(CoreBgEvent::StreamUrlPrefetched { video_id: vid, res });
         });
     }
@@ -1239,15 +1248,20 @@ impl VibesCore {
         self.reconnect_attempts = 0;
         self.last_resume_save_secs = self.position_secs;
 
+        let mut used_cache = false;
         let stream_target = if !item.is_live
             && !item.id.is_empty()
-            && let Some((cached_url, fetched_at)) = self.stream_url_cache.get(&item.id)
+            && let Some((cached, fetched_at)) = self.stream_url_cache.get(&item.id)
             && fetched_at.elapsed() < Duration::from_secs(3 * 3600)
+            && cached.available_at.is_none_or(|t| SystemTime::now() >= t)
         {
-            cached_url.clone()
+            used_cache = true;
+            cached.url.clone()
         } else {
             item.url.clone()
         };
+        self.current_used_cached_stream = used_cache;
+        self.yt_stream_retried = false;
 
         if let Some(ref mpv) = self.mpv {
             let _ = mpv.set_speed(self.speed);
@@ -1793,12 +1807,14 @@ impl VibesCore {
 
         let albums_dir = self.config.albums_dir.clone();
         let format = self.config.save_audio_format;
+        let cookies = self.config.yt_cookies_browser.ytdlp_arg();
         let tx = self.bg_tx.clone();
 
         std::thread::spawn(move || {
             run_save_song(
                 &albums_dir,
                 format,
+                cookies,
                 &parsed,
                 &source_station,
                 direct_url.as_deref(),
@@ -1834,10 +1850,12 @@ impl VibesCore {
         self.show_toast(format!("Retrying {}…", item.title), cx);
         let albums_dir = self.config.albums_dir.clone();
         let format = self.config.save_audio_format;
+        let cookies = self.config.yt_cookies_browser.ytdlp_arg();
         let tx = self.bg_tx.clone();
         let fid = item.id.clone();
         std::thread::spawn(move || {
-            let res = run_retry_failed_item(&item, &albums_dir, format).map_err(|e| format!("{e}"));
+            let res = run_retry_failed_item(&item, &albums_dir, format, cookies)
+                .map_err(|e| format!("{e}"));
             let _ = tx.send_blocking(CoreBgEvent::FailedItemRetried { id: fid, res });
         });
         cx.notify();
@@ -1851,12 +1869,13 @@ impl VibesCore {
         self.show_toast(format!("Retrying {} failed downloads…", items.len()), cx);
         let albums_dir = self.config.albums_dir.clone();
         let format = self.config.save_audio_format;
+        let cookies = self.config.yt_cookies_browser.ytdlp_arg();
         let tx = self.bg_tx.clone();
         std::thread::spawn(move || {
             for item in items {
                 let fid = item.id.clone();
-                let res =
-                    run_retry_failed_item(&item, &albums_dir, format).map_err(|e| format!("{e}"));
+                let res = run_retry_failed_item(&item, &albums_dir, format, cookies)
+                    .map_err(|e| format!("{e}"));
                 let _ = tx.send_blocking(CoreBgEvent::FailedItemRetried { id: fid, res });
             }
         });
@@ -2459,6 +2478,28 @@ impl VibesCore {
         cx.notify();
     }
 
+    pub fn set_yt_cookies_browser(
+        &mut self,
+        src: YoutubeCookiesSource,
+        cx: &mut Context<Self>,
+    ) {
+        self.config.yt_cookies_browser = src;
+        self.persist_config();
+        self.stream_url_cache.clear();
+        if let Some(ref mpv) = self.mpv {
+            let _ = mpv.set_ytdl_cookies(src.ytdlp_arg());
+        }
+        self.show_toast(
+            if src == YoutubeCookiesSource::None {
+                "YouTube browser cookies disabled".to_string()
+            } else {
+                format!("YouTube cookies set to {}", src.label())
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
     pub fn open_folder(&self, path: &std::path::Path) {
         let _ = std::fs::create_dir_all(path);
         let _ = Command::new("xdg-open").arg(path).spawn();
@@ -2670,13 +2711,15 @@ impl VibesCore {
         };
         let albums_dir = self.config.albums_dir.clone();
         let format = self.config.save_audio_format;
+        let cookies = self.config.yt_cookies_browser.ytdlp_arg();
         let tx = self.bg_tx.clone();
         let browse_id = next.browse_id.clone();
 
         std::thread::spawn(move || {
-            let (status, failures) = run_artist_sync(&albums_dir, format, &next, cancel, |st| {
-                let _ = tx.send_blocking(CoreBgEvent::ArtistSyncProgress(st));
-            });
+            let (status, failures) =
+                run_artist_sync(&albums_dir, format, cookies, &next, cancel, |st| {
+                    let _ = tx.send_blocking(CoreBgEvent::ArtistSyncProgress(st));
+                });
             let _ = tx.send_blocking(CoreBgEvent::ArtistSyncFinished {
                 browse_id,
                 status,
@@ -2898,17 +2941,25 @@ impl VibesCore {
         let albums_dir = self.config.albums_dir.clone();
         let mode = self.config.album_folder_mode;
         let format = self.config.save_audio_format;
+        let cookies = self.config.yt_cookies_browser.ytdlp_arg();
         let clean_editions = self.config.clean_editions;
         let tx = self.bg_tx.clone();
 
         std::thread::spawn(move || {
-            let (status, failures) =
-                run_download_album(&albums_dir, mode, format, &details, clean_editions, |st| {
+            let (status, failures) = run_download_album(
+                &albums_dir,
+                mode,
+                format,
+                cookies,
+                &details,
+                clean_editions,
+                |st| {
                     let _ = tx.send_blocking(CoreBgEvent::AlbumDownloadProgress {
                         job_id,
                         status: st,
                     });
-                });
+                },
+            );
             let _ = tx.send_blocking(CoreBgEvent::AlbumDownloadFinished {
                 job_id,
                 status,
@@ -3022,6 +3073,10 @@ impl VibesCore {
                 let prev_pos = self.position_secs;
                 let prev_whole = prev_pos as u64;
                 self.position_secs = pos;
+                if pos > 0.0 && self.buffering {
+                    self.buffering = false;
+                    dirty_ui = true;
+                }
                 let line_changed = if let LyricsState::Ready(ref doc) = self.lyrics_state
                     && let LyricsKind::Synced(ref lines) = doc.kind
                 {
@@ -3073,7 +3128,14 @@ impl VibesCore {
                 dirty_ui = true;
             }
             MpvEvent::Error(msg) => {
-                self.show_toast(format!("Stream error: {msg}"), cx);
+                let is_generic = msg == "loading failed" || msg == "unrecognized file format";
+                let has_yt_detail = self
+                    .toast
+                    .as_deref()
+                    .is_some_and(|t| t.contains("YouTube") || t.contains("[youtube]"));
+                if !(is_generic && has_yt_detail) {
+                    self.show_toast(format!("Stream error: {msg}"), cx);
+                }
             }
             MpvEvent::EndFile { reason } => {
                 // `loadfile ... replace` and playlist redirects emit `stop`/`redirect` for the old entry
@@ -3148,6 +3210,32 @@ impl VibesCore {
                                 sync_dbus = true;
                                 dirty_ui = true;
                             }
+                        }
+                        Some(PlayTarget::Youtube(yt)) if reason == "error" => {
+                            if self.current_used_cached_stream && !self.yt_stream_retried {
+                                if !yt.id.is_empty() {
+                                    self.stream_url_cache.remove(&yt.id);
+                                }
+                                self.current_used_cached_stream = false;
+                                self.yt_stream_retried = true;
+                                self.buffering = true;
+                                let resume = self.state.resume_positions.get(&yt.id).copied();
+                                if let Some(ref mpv) = self.mpv {
+                                    let _ = mpv.load_url(&yt.url, resume);
+                                }
+                                self.sync_integrations();
+                                if self.window_open {
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            self.playing = false;
+                            self.paused = false;
+                            self.buffering = false;
+                            self.refresh_visualizer_state();
+                            self.sync_lyrics_overlay();
+                            sync_dbus = true;
+                            dirty_ui = true;
                         }
                         _ => {
                             self.playing = false;

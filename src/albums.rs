@@ -585,6 +585,7 @@ pub fn download_album_tracks_with_failures(
     albums_dir: &Path,
     folder_mode: AlbumFolderMode,
     format: SaveAudioFormat,
+    cookies_browser: Option<&str>,
     details: &AlbumDetails,
     cancel: Option<&AtomicBool>,
     mut on_track_progress: impl FnMut(String, usize, usize),
@@ -665,7 +666,14 @@ pub fn download_album_tracks_with_failures(
             continue;
         }
 
-        match extract_ytdlp_audio_with_retry(&track.url, &album_dir, &clean_name, format, false) {
+        match extract_ytdlp_audio_with_retry(
+            &track.url,
+            &album_dir,
+            &clean_name,
+            format,
+            false,
+            cookies_browser,
+        ) {
             Ok(actual_path) => {
                 let track_artist = if track.artist.trim().is_empty() {
                     details.summary.artist.trim().to_string()
@@ -744,6 +752,7 @@ pub fn run_download_album(
     albums_dir: &Path,
     folder_mode: AlbumFolderMode,
     format: SaveAudioFormat,
+    cookies_browser: Option<&str>,
     details: &AlbumDetails,
     clean_editions: bool,
     mut on_progress: impl FnMut(AlbumDownloadStatus),
@@ -756,6 +765,7 @@ pub fn run_download_album(
         albums_dir,
         folder_mode,
         format,
+        cookies_browser,
         &effective,
         None,
         |current_track, completed, total| {

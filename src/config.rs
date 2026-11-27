@@ -88,6 +88,58 @@ impl AlbumFolderMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum YoutubeCookiesSource {
+    #[default]
+    None,
+    Firefox,
+    Chromium,
+    Chrome,
+    Brave,
+    Vivaldi,
+    Edge,
+    Opera,
+}
+
+impl YoutubeCookiesSource {
+    pub const ALL: [Self; 8] = [
+        Self::None,
+        Self::Firefox,
+        Self::Chromium,
+        Self::Chrome,
+        Self::Brave,
+        Self::Vivaldi,
+        Self::Edge,
+        Self::Opera,
+    ];
+
+    pub fn ytdlp_arg(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Firefox => Some("firefox"),
+            Self::Chromium => Some("chromium"),
+            Self::Chrome => Some("chrome"),
+            Self::Brave => Some("brave"),
+            Self::Vivaldi => Some("vivaldi"),
+            Self::Edge => Some("edge"),
+            Self::Opera => Some("opera"),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Off",
+            Self::Firefox => "Firefox",
+            Self::Chromium => "Chromium",
+            Self::Chrome => "Chrome",
+            Self::Brave => "Brave",
+            Self::Vivaldi => "Vivaldi",
+            Self::Edge => "Edge",
+            Self::Opera => "Opera",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VibesConfig {
     #[serde(default)]
@@ -116,6 +168,8 @@ pub struct VibesConfig {
     pub album_folder_mode: AlbumFolderMode,
     #[serde(default = "default_true")]
     pub clean_editions: bool,
+    #[serde(default)]
+    pub yt_cookies_browser: YoutubeCookiesSource,
 }
 
 fn default_true() -> bool {
@@ -165,6 +219,7 @@ impl Default for VibesConfig {
             albums_dir: default_albums_dir(),
             album_folder_mode: AlbumFolderMode::ArtistAndAlbum,
             clean_editions: true,
+            yt_cookies_browser: YoutubeCookiesSource::None,
         }
     }
 }
@@ -400,6 +455,7 @@ mod tests {
             albums_dir: tmp.path().join("Albums"),
             album_folder_mode: AlbumFolderMode::AlbumPrefix,
             clean_editions: true,
+            yt_cookies_browser: YoutubeCookiesSource::Firefox,
         };
         atomic_write_json(&cfg_file, &cfg).unwrap();
         let parsed_cfg: VibesConfig =

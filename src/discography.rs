@@ -714,6 +714,7 @@ fn format_failed_at() -> String {
 pub fn run_artist_sync(
     albums_dir: &Path,
     format: SaveAudioFormat,
+    cookies_browser: Option<&str>,
     followed: &FollowedArtist,
     cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(ArtistSyncStatus),
@@ -874,7 +875,14 @@ pub fn run_artist_sync(
                 });
 
                 let clean_name = sanitize_filename(&tr.title);
-                match extract_ytdlp_audio_with_retry(&tr.url, &singles_dir, &clean_name, format, false) {
+                match extract_ytdlp_audio_with_retry(
+                    &tr.url,
+                    &singles_dir,
+                    &clean_name,
+                    format,
+                    false,
+                    cookies_browser,
+                ) {
                     Ok(actual_path) => {
                         if cached_cover.is_none()
                             && let Some(ref curl) = details.cover_url.as_ref().or(rel.cover_url.as_ref())
@@ -941,6 +949,7 @@ pub fn run_artist_sync(
                 albums_dir,
                 AlbumFolderMode::ArtistAndAlbum,
                 format,
+                cookies_browser,
                 &filtered_details,
                 Some(&cancel),
                 |current_track, _done, _tot| {

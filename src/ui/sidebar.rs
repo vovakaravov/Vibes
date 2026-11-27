@@ -1,5 +1,5 @@
 use super::{VibesWindow, art};
-use crate::core::{NavSection, VibesCore};
+use crate::core::{DiscoverTab, NavSection, VibesCore};
 use crate::theme::{hsla, rgb_with_alpha};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -11,6 +11,7 @@ use gpui_kit::{
 
 struct SidebarRow {
     sec: NavSection,
+    disc_tracks: Option<bool>,
     icon: IconName,
     label: &'static str,
     badge: Option<String>,
@@ -32,13 +33,21 @@ fn render_group_header(label: &'static str, pal: &crate::theme::Palette) -> AnyE
 fn render_nav_row(
     item: SidebarRow,
     active_sec: NavSection,
+    active_disc_tab: DiscoverTab,
     pal: &crate::theme::Palette,
     win: &VibesWindow,
     cx: &mut Context<VibesWindow>,
 ) -> AnyElement {
-    let is_active = item.sec == active_sec;
+    let is_active = match item.disc_tracks {
+        Some(true) => active_sec == NavSection::Discover && active_disc_tab == DiscoverTab::Tracks,
+        Some(false) => {
+            active_sec == NavSection::Discover && active_disc_tab != DiscoverTab::Tracks
+        }
+        None => item.sec == active_sec,
+    };
     let core_ent = win.core.clone();
     let sec = item.sec;
+    let disc_tracks = item.disc_tracks;
     let pal = pal.clone();
 
     div()
@@ -63,6 +72,13 @@ fn render_nav_row(
         .on_click(cx.listener(move |_, _, _, cx| {
             core_ent.update(cx, |c: &mut VibesCore, cx| {
                 c.section = sec;
+                match disc_tracks {
+                    Some(true) => c.discover_tab = DiscoverTab::Tracks,
+                    Some(false) if c.discover_tab == DiscoverTab::Tracks => {
+                        c.discover_tab = DiscoverTab::Artists;
+                    }
+                    _ => {}
+                }
                 cx.notify();
             });
         }))
@@ -125,6 +141,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
     let (
         pal,
         active_sec,
+        active_disc_tab,
         artists_count,
         albums_count,
         playlists_count,
@@ -163,6 +180,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
         (
             core.palette.clone(),
             core.section,
+            core.discover_tab,
             core.local_library.artists.len(),
             core.local_library.albums.len(),
             core.state.playlists.len() + usize::from(!core.state.liked_tracks.is_empty()),
@@ -178,6 +196,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
     let library_items = [
         SidebarRow {
             sec: NavSection::Artists,
+            disc_tracks: None,
             icon: IconName::Library,
             label: "Artists",
             badge: (artists_count > 0).then(|| artists_count.to_string()),
@@ -185,6 +204,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
         },
         SidebarRow {
             sec: NavSection::Albums,
+            disc_tracks: None,
             icon: IconName::Disc3,
             label: "Albums",
             badge: (albums_count > 0).then(|| albums_count.to_string()),
@@ -192,6 +212,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
         },
         SidebarRow {
             sec: NavSection::Playlists,
+            disc_tracks: None,
             icon: IconName::ListMusic,
             label: "Playlists",
             badge: (playlists_count > 0).then(|| playlists_count.to_string()),
@@ -202,13 +223,23 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
     let discover_items = [
         SidebarRow {
             sec: NavSection::Discover,
+            disc_tracks: Some(true),
             icon: IconName::Search,
-            label: "Search & Follow",
+            label: "Search Songs",
+            badge: None,
+            badge_danger: false,
+        },
+        SidebarRow {
+            sec: NavSection::Discover,
+            disc_tracks: Some(false),
+            icon: IconName::Disc3,
+            label: "Artists & Albums",
             badge: None,
             badge_danger: false,
         },
         SidebarRow {
             sec: NavSection::Radio,
+            disc_tracks: None,
             icon: IconName::Radio,
             label: "Live Radio",
             badge: None,
@@ -219,6 +250,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
     let activity_items = [
         SidebarRow {
             sec: NavSection::Queue,
+            disc_tracks: None,
             icon: IconName::Play,
             label: "Up Next",
             badge: (queue_count > 0).then(|| queue_count.to_string()),
@@ -226,6 +258,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
         },
         SidebarRow {
             sec: NavSection::Downloads,
+            disc_tracks: None,
             icon: IconName::Download,
             label: "Downloads",
             badge: if failed_dl > 0 {
@@ -241,6 +274,7 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
         },
         SidebarRow {
             sec: NavSection::Settings,
+            disc_tracks: None,
             icon: IconName::Settings,
             label: "Settings",
             badge: None,
@@ -261,19 +295,19 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
         .children(
             library_items
                 .into_iter()
-                .map(|it| render_nav_row(it, active_sec, &pal, win, cx)),
+                .map(|it| render_nav_row(it, active_sec, active_disc_tab, &pal, win, cx)),
         )
         .child(render_group_header("DISCOVER", &pal))
         .children(
             discover_items
                 .into_iter()
-                .map(|it| render_nav_row(it, active_sec, &pal, win, cx)),
+                .map(|it| render_nav_row(it, active_sec, active_disc_tab, &pal, win, cx)),
         )
         .child(render_group_header("ACTIVITY", &pal))
         .children(
             activity_items
                 .into_iter()
-                .map(|it| render_nav_row(it, active_sec, &pal, win, cx)),
+                .map(|it| render_nav_row(it, active_sec, active_disc_tab, &pal, win, cx)),
         )
         .when(!presets.is_empty(), |rail| {
             rail.child(render_group_header("PRESETS (1-6)", &pal)).child(

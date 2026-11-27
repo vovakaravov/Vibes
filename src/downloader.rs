@@ -475,12 +475,31 @@ pub fn extract_ytdlp_audio_with_retry(
     clean_name: &str,
     format: SaveAudioFormat,
     write_sidecars: bool,
+    cookies_browser: Option<&str>,
 ) -> Result<PathBuf> {
-    match extract_ytdlp_audio(url, dest_dir, clean_name, format, write_sidecars) {
+    match extract_ytdlp_audio(
+        url,
+        dest_dir,
+        clean_name,
+        format,
+        write_sidecars,
+        cookies_browser,
+    ) {
         Ok(p) => Ok(p),
-        Err(_first_err) => {
+        Err(first_err) => {
+            let err_txt = format!("{first_err}");
+            if err_txt.contains("Sign in to confirm") || err_txt.contains("cookies-from-browser") {
+                return Err(first_err);
+            }
             std::thread::sleep(std::time::Duration::from_millis(1500));
-            let res = extract_ytdlp_audio(url, dest_dir, clean_name, format, write_sidecars);
+            let res = extract_ytdlp_audio(
+                url,
+                dest_dir,
+                clean_name,
+                format,
+                write_sidecars,
+                cookies_browser,
+            );
             if res.is_err() {
                 if let Ok(entries) = fs::read_dir(dest_dir) {
                     for e in entries.flatten() {
@@ -504,12 +523,16 @@ pub fn extract_ytdlp_audio(
     clean_name: &str,
     format: SaveAudioFormat,
     write_sidecars: bool,
+    cookies_browser: Option<&str>,
 ) -> Result<PathBuf> {
     let final_path = dest_dir.join(format!("{clean_name}.{}", format.extension()));
     let template = format!("{}.%(ext)s", dest_dir.join(clean_name).to_string_lossy());
 
     let mut cmd = Command::new("yt-dlp");
     cmd.args(["--no-playlist", "--no-warnings"]);
+    if let Some(browser) = cookies_browser.map(str::trim).filter(|b| !b.is_empty()) {
+        cmd.args(["--cookies-from-browser", browser]);
+    }
     if format == SaveAudioFormat::Opus {
         cmd.args(["-f", "bestaudio[acodec^=opus]/bestaudio/best"]);
     }
@@ -779,6 +802,7 @@ pub fn resolve_song_destination_from_meta(
 pub fn run_save_song(
     albums_dir: &Path,
     format: SaveAudioFormat,
+    cookies_browser: Option<&str>,
     parsed: &ParsedTrack,
     source_station: &str,
     direct_url: Option<&str>,
@@ -851,7 +875,14 @@ pub fn run_save_song(
     }
 
     let stage_name = sanitize_filename(&parsed.display);
-    let status = match extract_ytdlp_audio_with_retry(&chosen_url, &stage_dir, &stage_name, format, true) {
+    let status = match extract_ytdlp_audio_with_retry(
+        &chosen_url,
+        &stage_dir,
+        &stage_name,
+        format,
+        true,
+        cookies_browser,
+    ) {
         Ok(staged_audio) => {
             let (info, cover_jpg) = find_and_clean_sidecars(&stage_dir, &stage_name);
             let radio_name = is_from_radio.then_some(source_station);
@@ -970,6 +1001,7 @@ pub fn run_retry_failed_item(
     item: &FailedDownloadItem,
     albums_dir: &Path,
     format: SaveAudioFormat,
+    cookies_browser: Option<&str>,
 ) -> Result<PathBuf> {
     let url = item
         .url
@@ -985,7 +1017,14 @@ pub fn run_retry_failed_item(
         fs::create_dir_all(&item.dest_dir)?;
         let num = item.track_number.unwrap_or(1);
         let clean_name = format!("{num:02} - {}", sanitize_filename(&item.title));
-        let path = extract_ytdlp_audio_with_retry(url, &item.dest_dir, &clean_name, format, true)?;
+        let path = extract_ytdlp_audio_with_retry(
+            url,
+            &item.dest_dir,
+            &clean_name,
+            format,
+            true,
+            cookies_browser,
+        )?;
         let (info, cover_jpg) = find_and_clean_sidecars(&item.dest_dir, &clean_name);
         let cover_fallback = cover_jpg.or_else(|| fs::read(item.dest_dir.join("cover.jpg")).ok());
         let parsed = ParsedTrack {
@@ -1012,7 +1051,15 @@ pub fn run_retry_failed_item(
             title: item.title.clone(),
             display: format!("{} - {}", item.artist, item.title),
         };
-        match run_save_song(albums_dir, format, &parsed, "", Some(url), |_| {}) {
+        match run_save_song(
+            albums_dir,
+            format,
+            cookies_browser,
+            &parsed,
+            "",
+            Some(url),
+            |_| {},
+        ) {
             DownloadStatus::Saved(p) | DownloadStatus::AlreadyExists(p) => Ok(p),
             DownloadStatus::Failed(e) => anyhow::bail!("{e}"),
             _ => anyhow::bail!("Retry did not finish"),
