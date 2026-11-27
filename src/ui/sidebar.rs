@@ -1,85 +1,251 @@
 use super::{VibesWindow, art};
 use crate::core::{NavSection, VibesCore};
-use crate::theme::hsla;
+use crate::theme::{hsla, rgb_with_alpha};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px,
+    AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px,
 };
 
-pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> impl IntoElement {
-    let core = win.core.read(cx);
-    let pal = core.palette.clone();
-    let active_sec = core.section;
-    let local_album_count = core.local_library.albums.len();
-    let fav_count = core.state.favorites.len();
-    let log_count = core.state.song_log.len();
-    let queue_count = core.queue.len();
-    let active_dl = core.active_saving_count();
-    let dl_total = core.downloads.len() + core.album_downloads.len();
-    let presets: Vec<(usize, String, crate::radio::RadioStation, Option<std::path::PathBuf>)> = core
-        .state
-        .favorites
-        .iter()
-        .take(6)
-        .enumerate()
-        .map(|(i, s)| {
-            (
-                i + 1,
-                s.name.clone(),
-                s.clone(),
-                core.art_path_for_url(&s.favicon).cloned(),
-            )
+struct SidebarRow {
+    sec: NavSection,
+    icon: IconName,
+    label: &'static str,
+    badge: Option<String>,
+    badge_danger: bool,
+}
+
+fn render_group_header(label: &'static str, pal: &crate::theme::Palette) -> AnyElement {
+    div()
+        .mt_2()
+        .px_2()
+        .py_0p5()
+        .text_size(px(10.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(hsla(pal.fg_muted))
+        .child(label)
+        .into_any_element()
+}
+
+fn render_nav_row(
+    item: SidebarRow,
+    active_sec: NavSection,
+    pal: &crate::theme::Palette,
+    win: &VibesWindow,
+    cx: &mut Context<VibesWindow>,
+) -> AnyElement {
+    let is_active = item.sec == active_sec;
+    let core_ent = win.core.clone();
+    let sec = item.sec;
+    let pal = pal.clone();
+
+    div()
+        .id(SharedString::from(format!("nav-{}", item.label)))
+        .w_full()
+        .h(px(31.))
+        .px_2()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .bg(if is_active {
+            rgb_with_alpha(pal.accent, 0x22)
+        } else {
+            hsla(pal.bg_sidebar)
         })
-        .collect();
-    let current_stream = match &core.current_target {
-        Some(crate::config::PlayTarget::Radio(s)) => Some(s.stream_url().to_lowercase()),
-        _ => None,
+        .border_l_2()
+        .border_color(hsla(if is_active {
+            pal.accent
+        } else {
+            pal.bg_sidebar
+        }))
+        .hover(|s| s.bg(hsla(pal.bg_panel)))
+        .on_click(cx.listener(move |_, _, _, cx| {
+            core_ent.update(cx, |c: &mut VibesCore, cx| {
+                c.section = sec;
+                cx.notify();
+            });
+        }))
+        .child(
+            h_flex()
+                .size_full()
+                .items_center()
+                .justify_between()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(Icon::new(item.icon).small().text_color(hsla(if is_active {
+                            pal.accent
+                        } else {
+                            pal.fg_muted
+                        })))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(if is_active {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(hsla(if is_active { pal.fg } else { pal.fg_subtle }))
+                                .child(item.label),
+                        ),
+                )
+                .when_some(item.badge, |row, b| {
+                    row.child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(px(99.))
+                            .bg(if item.badge_danger {
+                                rgb_with_alpha(pal.red, 0x33)
+                            } else {
+                                hsla(pal.bg_btn)
+                            })
+                            .text_size(px(10.))
+                            .font_weight(if item.badge_danger {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(hsla(if item.badge_danger {
+                                pal.red
+                            } else {
+                                pal.fg_muted
+                            }))
+                            .child(b),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> impl IntoElement {
+    let (
+        pal,
+        active_sec,
+        artists_count,
+        albums_count,
+        playlists_count,
+        queue_count,
+        active_dl,
+        failed_dl,
+        dl_total,
+        presets,
+        current_stream,
+    ) = {
+        let core = win.core.read(cx);
+        let presets: Vec<(
+            usize,
+            String,
+            crate::radio::RadioStation,
+            Option<std::path::PathBuf>,
+        )> = core
+            .state
+            .favorites
+            .iter()
+            .take(6)
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    i + 1,
+                    s.name.clone(),
+                    s.clone(),
+                    core.art_path_for_url(&s.favicon).cloned(),
+                )
+            })
+            .collect();
+        let current_stream = match &core.current_target {
+            Some(crate::config::PlayTarget::Radio(s)) => Some(s.stream_url().to_lowercase()),
+            _ => None,
+        };
+        (
+            core.palette.clone(),
+            core.section,
+            core.local_library.artists.len(),
+            core.local_library.albums.len(),
+            core.state.playlists.len() + usize::from(!core.state.liked_tracks.is_empty()),
+            core.queue.len(),
+            core.active_saving_count(),
+            core.state.failed_downloads.len(),
+            core.downloads.len() + core.album_downloads.len(),
+            presets,
+            current_stream,
+        )
     };
 
-    let nav_items: Vec<(NavSection, IconName, &str, Option<String>)> = vec![
-        (NavSection::Radio, IconName::Radio, "Radio", None),
-        (NavSection::Youtube, IconName::Headphones, "YouTube Audio", None),
-        (NavSection::Albums, IconName::Disc3, "Albums", None),
-        (
-            NavSection::Library,
-            IconName::Music,
-            "Local Library",
-            (local_album_count > 0).then(|| local_album_count.to_string()),
-        ),
-        (
-            NavSection::Favorites,
-            IconName::Star,
-            "Favorites",
-            (fav_count > 0).then(|| fav_count.to_string()),
-        ),
-        (
-            NavSection::SongLog,
-            IconName::Clock,
-            "Song Log",
-            (log_count > 0).then(|| log_count.to_string()),
-        ),
-        (
-            NavSection::Queue,
-            IconName::ListMusic,
-            "Queue",
-            (queue_count > 0).then(|| queue_count.to_string()),
-        ),
-        (
-            NavSection::Downloads,
-            IconName::Download,
-            "Saved Songs",
-            if active_dl > 0 {
+    let library_items = [
+        SidebarRow {
+            sec: NavSection::Artists,
+            icon: IconName::Library,
+            label: "Artists",
+            badge: (artists_count > 0).then(|| artists_count.to_string()),
+            badge_danger: false,
+        },
+        SidebarRow {
+            sec: NavSection::Albums,
+            icon: IconName::Disc3,
+            label: "Albums",
+            badge: (albums_count > 0).then(|| albums_count.to_string()),
+            badge_danger: false,
+        },
+        SidebarRow {
+            sec: NavSection::Playlists,
+            icon: IconName::ListMusic,
+            label: "Playlists",
+            badge: (playlists_count > 0).then(|| playlists_count.to_string()),
+            badge_danger: false,
+        },
+    ];
+
+    let discover_items = [
+        SidebarRow {
+            sec: NavSection::Discover,
+            icon: IconName::Search,
+            label: "Search & Follow",
+            badge: None,
+            badge_danger: false,
+        },
+        SidebarRow {
+            sec: NavSection::Radio,
+            icon: IconName::Radio,
+            label: "Live Radio",
+            badge: None,
+            badge_danger: false,
+        },
+    ];
+
+    let activity_items = [
+        SidebarRow {
+            sec: NavSection::Queue,
+            icon: IconName::Play,
+            label: "Up Next",
+            badge: (queue_count > 0).then(|| queue_count.to_string()),
+            badge_danger: false,
+        },
+        SidebarRow {
+            sec: NavSection::Downloads,
+            icon: IconName::Download,
+            label: "Downloads",
+            badge: if failed_dl > 0 {
+                Some(format!("{failed_dl}!"))
+            } else if active_dl > 0 {
                 Some(format!("{active_dl}…"))
             } else if dl_total > 0 {
                 Some(dl_total.to_string())
             } else {
                 None
             },
-        ),
-        (NavSection::Settings, IconName::Settings, "Settings", None),
+            badge_danger: failed_dl > 0,
+        },
+        SidebarRow {
+            sec: NavSection::Settings,
+            icon: IconName::Settings,
+            label: "Settings",
+            badge: None,
+            badge_danger: false,
+        },
     ];
 
     v_flex()
@@ -90,86 +256,27 @@ pub fn render_sidebar(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) -> i
         .border_r_1()
         .border_color(hsla(pal.border_subtle))
         .p_2p5()
-        .gap_1()
-        .child(
-            div()
-                .px_2()
-                .py_1()
-                .text_size(px(10.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(hsla(pal.fg_muted))
-                .child("CHANNELS"),
+        .gap_0p5()
+        .child(render_group_header("LIBRARY", &pal))
+        .children(
+            library_items
+                .into_iter()
+                .map(|it| render_nav_row(it, active_sec, &pal, win, cx)),
         )
-        .children(nav_items.into_iter().map(|(sec, icon, label, badge)| {
-            let is_active = sec == active_sec;
-            let core_ent = win.core.clone();
-            div()
-                .id(SharedString::from(format!("nav-{label}")))
-                .w_full()
-                .h(px(32.))
-                .px_2p5()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .bg(hsla(if is_active { pal.bg_panel } else { pal.bg_sidebar }))
-                .hover(|s| s.bg(hsla(pal.bg_panel)))
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    core_ent.update(cx, |c: &mut VibesCore, cx| {
-                        c.section = sec;
-                        cx.notify();
-                    });
-                }))
-                .child(
-                    h_flex()
-                        .size_full()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(Icon::new(icon).small().text_color(hsla(if is_active {
-                                    pal.accent
-                                } else {
-                                    pal.fg_muted
-                                })))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(if is_active {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::MEDIUM
-                                        })
-                                        .text_color(hsla(if is_active { pal.fg } else { pal.fg_subtle }))
-                                        .child(label),
-                                ),
-                        )
-                        .when_some(badge, |row, b| {
-                            row.child(
-                                div()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded(px(99.))
-                                    .bg(hsla(pal.bg_btn))
-                                    .text_size(px(10.))
-                                    .text_color(hsla(pal.fg_muted))
-                                    .child(b),
-                            )
-                        }),
-                )
-        }))
+        .child(render_group_header("DISCOVER", &pal))
+        .children(
+            discover_items
+                .into_iter()
+                .map(|it| render_nav_row(it, active_sec, &pal, win, cx)),
+        )
+        .child(render_group_header("ACTIVITY", &pal))
+        .children(
+            activity_items
+                .into_iter()
+                .map(|it| render_nav_row(it, active_sec, &pal, win, cx)),
+        )
         .when(!presets.is_empty(), |rail| {
-            rail.child(
-                div()
-                    .mt_3()
-                    .px_2()
-                    .py_1()
-                    .text_size(px(10.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(hsla(pal.fg_muted))
-                    .child("PRESETS (1-6)"),
-            )
-            .child(
+            rail.child(render_group_header("PRESETS (1-6)", &pal)).child(
                 v_flex()
                     .flex_1()
                     .min_h_0()

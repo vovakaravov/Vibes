@@ -1,16 +1,19 @@
-use crate::config::{AlbumFolderMode, SaveAudioFormat};
+use crate::config::{AlbumFolderMode, FailedDownloadItem, FailedDownloadKind, SaveAudioFormat};
+use crate::discography::{filter_album_tracks, find_canonical_artist_dir};
 use crate::downloader::{
-    TrackTagSpec, crop_thumbnail_to_square_jpg, extract_ytdlp_audio, sanitize_filename,
+    TrackTagSpec, crop_thumbnail_to_square_jpg, extract_ytdlp_audio_with_retry, sanitize_filename,
     write_tags_and_cover,
 };
 use crate::youtube::{format_duration, parse_ytdlp_ndjson};
 use anyhow::{Context, Result};
+use chrono::Local;
 use lofty::tag::items::Timestamp;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const YTM_SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
@@ -86,7 +89,7 @@ pub struct AlbumDownloadJob {
     pub details: AlbumDetails,
 }
 
-fn ytm_context() -> Value {
+pub(crate) fn ytm_context() -> Value {
     json!({
         "client": {
             "clientName": "WEB_REMIX",
@@ -104,7 +107,7 @@ fn build_agent() -> ureq::Agent {
         .into()
 }
 
-fn join_runs(runs: Option<&Vec<Value>>) -> String {
+pub(crate) fn join_runs(runs: Option<&Vec<Value>>) -> String {
     runs.map(|arr| {
         arr.iter()
             .filter_map(|r| r.get("text").and_then(|v| v.as_str()))
@@ -115,7 +118,7 @@ fn join_runs(runs: Option<&Vec<Value>>) -> String {
     .to_string()
 }
 
-fn best_thumbnail_url(val: &Value) -> Option<String> {
+pub(crate) fn best_thumbnail_url(val: &Value) -> Option<String> {
     val.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.last())
@@ -149,7 +152,7 @@ fn parse_year_token(text: &str) -> Option<u16> {
     None
 }
 
-fn extract_subtitle_parts(subtitle: &str) -> (String, String, Option<u16>) {
+pub(crate) fn extract_subtitle_parts(subtitle: &str) -> (String, String, Option<u16>) {
     let parts: Vec<&str> = subtitle
         .split('•')
         .map(|p| p.trim())
@@ -181,7 +184,7 @@ fn extract_subtitle_parts(subtitle: &str) -> (String, String, Option<u16>) {
     (release_type, artist, year)
 }
 
-fn walk_json<'a>(val: &'a Value, visit: &mut impl FnMut(&'a Value)) {
+pub(crate) fn walk_json<'a>(val: &'a Value, visit: &mut impl FnMut(&'a Value)) {
     visit(val);
     match val {
         Value::Object(map) => {
@@ -396,7 +399,7 @@ pub fn extract_playlist_id_from_url(input: &str) -> Option<String> {
     None
 }
 
-fn post_ytm_json(url: &str, payload: &Value) -> Result<Value> {
+pub(crate) fn post_ytm_json(url: &str, payload: &Value) -> Result<Value> {
     let agent = build_agent();
     let json_body = serde_json::to_string(payload)?;
     let mut resp = agent
@@ -504,7 +507,9 @@ pub fn resolve_album_dir(
     let clean_artist = sanitize_filename(artist);
     let clean_album = sanitize_filename(album_title);
     match mode {
-        AlbumFolderMode::ArtistAndAlbum => albums_dir.join(clean_artist).join(clean_album),
+        AlbumFolderMode::ArtistAndAlbum => {
+            find_canonical_artist_dir(albums_dir, artist).join(clean_album)
+        }
         AlbumFolderMode::AlbumPrefix => albums_dir.join(format!("Album - {clean_album}")),
         AlbumFolderMode::ArtistDashAlbum => {
             albums_dir.join(format!("{clean_artist} - {clean_album}"))
@@ -576,39 +581,54 @@ pub fn apply_album_track_tags(
     write_tags_and_cover(audio_path, &spec, cover_jpg)
 }
 
-pub fn run_download_album(
+pub fn download_album_tracks_with_failures(
     albums_dir: &Path,
     folder_mode: AlbumFolderMode,
     format: SaveAudioFormat,
     details: &AlbumDetails,
-    mut on_progress: impl FnMut(AlbumDownloadStatus),
-) -> AlbumDownloadStatus {
-    let album_dir = resolve_album_dir(
-        albums_dir,
-        folder_mode,
-        &details.summary.artist,
-        &details.summary.title,
-    );
+    cancel: Option<&AtomicBool>,
+    mut on_track_progress: impl FnMut(String, usize, usize),
+) -> (AlbumDownloadStatus, Vec<FailedDownloadItem>) {
+    let is_single_release = details.tracks.len() <= 2
+        && (details.summary.release_type.eq_ignore_ascii_case("Single")
+            || details.tracks.len() == 1);
+
+    let album_dir = if is_single_release && folder_mode == AlbumFolderMode::ArtistAndAlbum {
+        find_canonical_artist_dir(albums_dir, &details.summary.artist).join("Singles")
+    } else {
+        resolve_album_dir(
+            albums_dir,
+            folder_mode,
+            &details.summary.artist,
+            &details.summary.title,
+        )
+    };
+
     if let Err(err) = fs::create_dir_all(&album_dir) {
-        let status = AlbumDownloadStatus::Failed(format!(
-            "Cannot create {}: {err}",
-            album_dir.display()
-        ));
-        on_progress(status.clone());
-        return status;
+        return (
+            AlbumDownloadStatus::Failed(format!("Cannot create {}: {err}", album_dir.display())),
+            Vec::new(),
+        );
     }
 
-    let cover_file = album_dir.join("cover.jpg");
-    let cover_jpg = if cover_file.exists() {
-        fs::read(&cover_file).ok()
-    } else if let Some(ref url) = details.cover_url {
-        let fetched = fetch_square_cover_jpg(url, &album_dir);
-        if let Some(ref bytes) = fetched {
-            let _ = fs::write(&cover_file, bytes);
-        }
-        fetched
+    let cover_jpg = if is_single_release {
+        details
+            .cover_url
+            .as_deref()
+            .and_then(|url| fetch_square_cover_jpg(url, &album_dir))
     } else {
-        None
+        let cover_file = album_dir.join("cover.jpg");
+        if cover_file.exists() {
+            fs::read(&cover_file).ok()
+        } else if let Some(ref url) = details.cover_url {
+            let fetched = fetch_square_cover_jpg(url, &album_dir);
+            if let Some(ref bytes) = fetched {
+                let _ = fs::write(&cover_file, bytes);
+            }
+            fetched
+        } else {
+            None
+        }
     };
 
     let lyrics_agent = crate::lyrics::new_http_agent();
@@ -616,27 +636,36 @@ pub fn run_download_album(
     let total_u32 = total as u32;
     let mut saved = 0usize;
     let mut skipped = 0usize;
-    let mut failed = 0usize;
+    let mut failures = Vec::new();
+    let artist_dir = find_canonical_artist_dir(albums_dir, &details.summary.artist);
 
     for (idx, track) in details.tracks.iter().enumerate() {
-        on_progress(AlbumDownloadStatus::Downloading {
-            completed: idx,
-            total,
-            current_track: format!("{:02} - {}", track.track_number, track.title),
-        });
-
-        let clean_name = format!(
-            "{:02} - {}",
-            track.track_number,
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            break;
+        }
+        let clean_name = if is_single_release {
             sanitize_filename(&track.title)
-        );
+        } else {
+            format!("{:02} - {}", track.track_number, sanitize_filename(&track.title))
+        };
+        on_track_progress(clean_name.clone(), idx, total);
+
         let expected_path = album_dir.join(format!("{clean_name}.{}", format.extension()));
-        if expected_path.exists() {
+        if expected_path.exists()
+            || crate::local_library::find_local_track_in_dir(
+                &album_dir,
+                track.track_number,
+                &track.title,
+            )
+            .is_some()
+            || (is_single_release
+                && crate::local_library::artist_has_track(&artist_dir, &track.title).is_some())
+        {
             skipped += 1;
             continue;
         }
 
-        match extract_ytdlp_audio(&track.url, &album_dir, &clean_name, format, false) {
+        match extract_ytdlp_audio_with_retry(&track.url, &album_dir, &clean_name, format, false) {
             Ok(actual_path) => {
                 let track_artist = if track.artist.trim().is_empty() {
                     details.summary.artist.trim().to_string()
@@ -647,7 +676,7 @@ pub fn run_download_album(
                     let query = crate::lyrics::LyricsQuery {
                         artist: track_artist,
                         title: track.title.clone(),
-                        album: Some(details.summary.title.clone()),
+                        album: (!is_single_release).then(|| details.summary.title.clone()),
                         duration_secs: track.duration_secs,
                     };
                     let res = crate::lyrics::fetch_lrclib_lyrics(&lyrics_agent, &query);
@@ -656,9 +685,13 @@ pub fn run_download_album(
                     None
                 };
 
+                let mut tagged_details = details.clone();
+                if is_single_release {
+                    tagged_details.summary.title = "Singles".to_string();
+                }
                 if let Err(err) = apply_album_track_tags(
                     &actual_path,
-                    details,
+                    &tagged_details,
                     track,
                     total_u32,
                     cover_jpg.as_deref(),
@@ -673,11 +706,27 @@ pub fn run_download_album(
                     "Vibes album track download failed ({}): {err}",
                     track.title
                 );
-                failed += 1;
+                failures.push(FailedDownloadItem {
+                    id: format!("alb-{}-{}", track.video_id, clean_name),
+                    kind: FailedDownloadKind::AlbumTrack,
+                    artist: details.summary.artist.clone(),
+                    album: Some(if is_single_release {
+                        "Singles".to_string()
+                    } else {
+                        details.summary.title.clone()
+                    }),
+                    title: track.title.clone(),
+                    track_number: (!is_single_release).then_some(track.track_number),
+                    url: Some(track.url.clone()),
+                    dest_dir: album_dir.clone(),
+                    error: format!("{err}"),
+                    failed_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
+                });
             }
         }
     }
 
+    let failed = failures.len();
     let final_status = if saved == 0 && skipped == 0 && failed > 0 {
         AlbumDownloadStatus::Failed(format!("All {failed} track downloads failed"))
     } else {
@@ -688,8 +737,37 @@ pub fn run_download_album(
             failed,
         }
     };
+    (final_status, failures)
+}
+
+pub fn run_download_album(
+    albums_dir: &Path,
+    folder_mode: AlbumFolderMode,
+    format: SaveAudioFormat,
+    details: &AlbumDetails,
+    clean_editions: bool,
+    mut on_progress: impl FnMut(AlbumDownloadStatus),
+) -> (AlbumDownloadStatus, Vec<FailedDownloadItem>) {
+    let mut effective = details.clone();
+    let (filtered_tracks, _) = filter_album_tracks(&details.tracks, clean_editions);
+    effective.tracks = filtered_tracks;
+
+    let (final_status, failures) = download_album_tracks_with_failures(
+        albums_dir,
+        folder_mode,
+        format,
+        &effective,
+        None,
+        |current_track, completed, total| {
+            on_progress(AlbumDownloadStatus::Downloading {
+                completed,
+                total,
+                current_track,
+            });
+        },
+    );
     on_progress(final_status.clone());
-    final_status
+    (final_status, failures)
 }
 
 #[cfg(test)]

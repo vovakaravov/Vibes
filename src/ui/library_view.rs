@@ -1,7 +1,7 @@
 use super::{VibesWindow, art};
 use crate::albums::AlbumDownloadStatus;
 use crate::config::{AlbumFolderMode, SaveAudioFormat, SaveFolderMode};
-use crate::core::{NavSection, QueueItem};
+use crate::core::{DiscoverTab, NavSection, QueueItem};
 use crate::downloader::DownloadStatus;
 use crate::theme::{ThemePreset, hsla, rgb_with_alpha};
 use crate::youtube::format_duration;
@@ -353,7 +353,8 @@ pub fn render_song_log_view(
                                                         s.set_value(&q, window, cx)
                                                     });
                                                     core_yt.update(cx, |c, cx| {
-                                                        c.section = NavSection::Youtube;
+                                                        c.section = NavSection::Discover;
+                                                        c.discover_tab = DiscoverTab::Tracks;
                                                         c.search_youtube_query(q, cx);
                                                     });
                                                 })),
@@ -382,7 +383,7 @@ pub fn render_queue_view(
     win: &mut VibesWindow,
     cx: &mut Context<VibesWindow>,
 ) -> impl IntoElement {
-    let (pal, queue) = {
+    let (pal, queue, shuffle_enabled, repeat_mode) = {
         let core = win.core.read(cx);
         let q: Vec<(QueueItem, Option<PathBuf>)> = core
             .queue
@@ -395,9 +396,18 @@ pub fn render_queue_view(
                 (it.clone(), art)
             })
             .collect();
-        (core.palette.clone(), q)
+        (
+            core.palette.clone(),
+            q,
+            core.state.shuffle_enabled,
+            core.state.repeat_mode,
+        )
     };
+    let q_len = queue.len();
     let core_clr = win.core.clone();
+    let core_shuf = win.core.clone();
+    let core_rep = win.core.clone();
+    let core_save_pl = win.core.clone();
 
     v_flex()
         .size_full()
@@ -411,26 +421,70 @@ pub fn render_queue_view(
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(Icon::new(IconName::ListMusic).text_color(hsla(pal.accent)))
+                        .child(Icon::new(IconName::Play).text_color(hsla(pal.accent)))
                         .child(
                             div()
                                 .text_base()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(hsla(pal.fg))
-                                .child("Playback Queue"),
+                                .child(format!("Up Next ({q_len})")),
                         ),
                 )
-                .when(!queue.is_empty(), |row| {
-                    row.child(
-                        Button::new("clear-queue-btn")
-                            .ghost()
-                            .xsmall()
-                            .label("Clear Queue")
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                core_clr.update(cx, |c, cx| c.clear_queue(cx));
-                            })),
-                    )
-                }),
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Button::new("q-tog-shuf")
+                                .with_variant(if shuffle_enabled {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .xsmall()
+                                .icon(IconName::Shuffle)
+                                .label(if shuffle_enabled { "Shuffle: On" } else { "Shuffle" })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_shuf.update(cx, |c, cx| c.toggle_shuffle(cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("q-cyc-rep")
+                                .with_variant(if repeat_mode != crate::config::RepeatMode::Off {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .xsmall()
+                                .icon(IconName::RefreshCw)
+                                .label(format!("Repeat: {}", repeat_mode.label()))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_rep.update(cx, |c, cx| c.cycle_repeat_mode(cx));
+                                })),
+                        )
+                        .when(q_len > 0, |row| {
+                            row.child(
+                                Button::new("q-save-pl")
+                                    .secondary()
+                                    .xsmall()
+                                    .icon(IconName::ListMusic)
+                                    .label("Save Playlist")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        core_save_pl.update(cx, |c, cx| {
+                                            c.save_queue_as_playlist(String::new(), cx)
+                                        });
+                                    })),
+                            )
+                            .child(
+                                Button::new("clear-queue-btn")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Clear")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        core_clr.update(cx, |c, cx| c.clear_queue(cx));
+                                    })),
+                            )
+                        }),
+                ),
         )
         .child(
             v_flex()
@@ -444,11 +498,13 @@ pub fn render_queue_view(
                             .p_6()
                             .text_xs()
                             .text_color(hsla(pal.fg_muted))
-                            .child("Queue is empty. Add tracks from Local Library, Albums, or YouTube Audio using +Queue."),
+                            .child("Up Next queue is empty. Add tracks from Artists, Albums, Playlists, or Search & Follow."),
                     )
                 })
                 .children(queue.into_iter().enumerate().map(|(ix, (item, art_path))| {
                     let core_play = win.core.clone();
+                    let core_up = win.core.clone();
+                    let core_dn = win.core.clone();
                     let core_rm = win.core.clone();
                     let is_local = item.is_local();
                     let title_txt = item.title().to_string();
@@ -535,6 +591,32 @@ pub fn render_queue_view(
                                 .child(
                                     h_flex()
                                         .gap_1()
+                                        .when(ix > 0, |r| {
+                                            r.child(
+                                                Button::new(SharedString::from(format!("q-up-{ix}")))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::ChevronUp)
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        core_up.update(cx, |c, cx| {
+                                                            c.move_queue_item(ix, -1, cx)
+                                                        });
+                                                    })),
+                                            )
+                                        })
+                                        .when(ix + 1 < q_len, |r| {
+                                            r.child(
+                                                Button::new(SharedString::from(format!("q-dn-{ix}")))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::ChevronDown)
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        core_dn.update(cx, |c, cx| {
+                                                            c.move_queue_item(ix, 1, cx)
+                                                        });
+                                                    })),
+                                            )
+                                        })
                                         .child(
                                             Button::new(SharedString::from(format!("q-play-{ix}")))
                                                 .primary()
@@ -568,7 +650,7 @@ pub fn render_downloads_view(
     win: &mut VibesWindow,
     cx: &mut Context<VibesWindow>,
 ) -> impl IntoElement {
-    let (pal, jobs, album_jobs, music_dir, albums_dir, fmt_label) = {
+    let (pal, jobs, album_jobs, failed_items, artist_sync, albums_dir, fmt_label) = {
         let core = win.core.read(cx);
         let jobs_with_art: Vec<(crate::downloader::DownloadJob, Option<PathBuf>)> = core
             .downloads
@@ -579,6 +661,7 @@ pub fn render_downloads_view(
                         .local_library
                         .singles
                         .iter()
+                        .chain(core.local_library.albums.iter().flat_map(|a| a.tracks.iter()))
                         .find(|t| &t.path == p)
                         .and_then(|t| t.cover_path.clone()),
                     _ => None,
@@ -610,14 +693,19 @@ pub fn render_downloads_view(
             core.palette.clone(),
             jobs_with_art,
             alb_jobs_with_art,
-            core.config.music_dir.display().to_string(),
+            core.state.failed_downloads.clone(),
+            core.artist_sync.clone(),
             core.config.albums_dir.clone(),
             core.config.save_audio_format.label(),
         )
     };
-    let core_open = win.core.clone();
     let core_open_alb = win.core.clone();
+    let core_retry_all = win.core.clone();
+    let core_clear_fail = win.core.clone();
+    let core_cancel_sync = win.core.clone();
     let albums_root = albums_dir.clone();
+    let sync_active = artist_sync.is_active();
+    let sync_summary = artist_sync.summary_line();
 
     v_flex()
         .size_full()
@@ -639,7 +727,7 @@ pub fn render_downloads_view(
                                         .text_base()
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(hsla(pal.fg))
-                                        .child("Saved Songs & Albums"),
+                                        .child("Downloads, Sync & Recovery"),
                                 ),
                         )
                         .child(
@@ -647,7 +735,7 @@ pub fn render_downloads_view(
                                 .text_xs()
                                 .text_color(hsla(pal.fg_muted))
                                 .child(format!(
-                                    "Format: {fmt_label} · Songs -> {music_dir} · Albums -> {}",
+                                    "Format: {fmt_label} · Destination: {}/<Artist>/<Album or Singles>/",
                                     albums_dir.display()
                                 )),
                         ),
@@ -655,42 +743,172 @@ pub fn render_downloads_view(
                 .child(
                     h_flex()
                         .gap_1p5()
+                        .when(!failed_items.is_empty(), |r| {
+                            r.child(
+                                Button::new("dl-retry-all-failed")
+                                    .primary()
+                                    .small()
+                                    .icon(IconName::RefreshCw)
+                                    .label(format!("Retry All Failed ({})", failed_items.len()))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        core_retry_all
+                                            .update(cx, |c, cx| c.retry_all_failed_downloads(cx));
+                                    })),
+                            )
+                            .child(
+                                Button::new("dl-clear-failed")
+                                    .ghost()
+                                    .small()
+                                    .label("Clear Failed")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        core_clear_fail
+                                            .update(cx, |c, cx| c.clear_failed_downloads(cx));
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("open-albums-folder")
                                 .secondary()
                                 .small()
-                                .icon(IconName::Disc3)
-                                .label("Albums Folder")
+                                .icon(IconName::Folder)
+                                .label("Music Folder")
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     core_open_alb.read(cx).open_folder(&albums_root);
-                                })),
-                        )
-                        .child(
-                            Button::new("open-music-folder")
-                                .secondary()
-                                .small()
-                                .icon(IconName::Folder)
-                                .label("Radio Songs")
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    core_open.read(cx).open_music_folder();
                                 })),
                         ),
                 ),
         )
+        .when(!sync_summary.is_empty(), |col| {
+            col.child(
+                h_flex()
+                    .p_2p5()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(7.))
+                    .bg(hsla(pal.bg_panel))
+                    .border_1()
+                    .border_color(hsla(if sync_active { pal.yellow } else { pal.border_subtle }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(hsla(if sync_active { pal.yellow } else { pal.green }))
+                            .truncate()
+                            .child(sync_summary),
+                    )
+                    .when(sync_active, |r| {
+                        r.child(
+                            Button::new("dl-cancel-sync")
+                                .danger()
+                                .xsmall()
+                                .label("Stop Sync")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_cancel_sync.update(cx, |c, cx| c.cancel_artist_sync(cx));
+                                })),
+                        )
+                    }),
+            )
+        })
         .child(
             v_flex()
                 .flex_1()
                 .min_h_0()
                 .gap_1p5()
                 .overflow_y_scrollbar()
-                .when(jobs.is_empty() && album_jobs.is_empty(), |list| {
+                .when(jobs.is_empty() && album_jobs.is_empty() && failed_items.is_empty(), |list| {
                     list.child(
                         div()
                             .p_6()
                             .text_xs()
                             .text_color(hsla(pal.fg_muted))
-                            .child("Download complete tagged albums from the Albums tab, or click Save Song (Ctrl+S) while listening to Radio / YouTube Audio."),
+                            .child("Follow artists or download albums & singles from Search & Follow, or press Ctrl+S while listening to Radio / YouTube. Any failed track stays tracked here so you never lose it."),
                     )
+                })
+                .when(!failed_items.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hsla(pal.red))
+                            .child(format!("FAILED DOWNLOADS ({})", failed_items.len())),
+                    )
+                    .children(failed_items.into_iter().enumerate().map(|(ix, item)| {
+                        let fid_retry = item.id.clone();
+                        let fid_dismiss = item.id.clone();
+                        let core_r = win.core.clone();
+                        let core_d = win.core.clone();
+                        let title_line = match &item.album {
+                            Some(alb) => format!("{} — {} ({alb})", item.artist, item.title),
+                            None => format!("{} — {}", item.artist, item.title),
+                        };
+                        div()
+                            .id(SharedString::from(format!("dl-fail-{ix}")))
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(7.))
+                            .bg(rgb_with_alpha(pal.red, 0x16))
+                            .border_1()
+                            .border_color(rgb_with_alpha(pal.red, 0x55))
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_0p5()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(hsla(pal.fg))
+                                                    .truncate()
+                                                    .child(title_line),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(hsla(pal.red))
+                                                    .truncate()
+                                                    .child(format!("{} · {}", item.failed_at, item.error)),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .flex_shrink_0()
+                                            .child(
+                                                Button::new(SharedString::from(format!("fail-retry-{ix}")))
+                                                    .secondary()
+                                                    .xsmall()
+                                                    .icon(IconName::RefreshCw)
+                                                    .label("Retry")
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        let id = fid_retry.clone();
+                                                        core_r.update(cx, |c, cx| {
+                                                            c.retry_failed_download(id, cx)
+                                                        });
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!("fail-dim-{ix}")))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::X)
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        core_d.update(cx, |c, cx| {
+                                                            c.dismiss_failed_download(&fid_dismiss, cx)
+                                                        });
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                    }))
                 })
                 .children(album_jobs.into_iter().enumerate().map(|(ix, (job, job_art))| {
                     let job_id = job.id;
@@ -956,6 +1174,9 @@ pub fn render_settings_view(
     let core_f1 = win.core.clone();
     let core_f2 = win.core.clone();
     let core_lyr_backfill = win.core.clone();
+    let core_clean_ed = win.core.clone();
+    let core_reorg = win.core.clone();
+    let reorg_running = win.core.read(cx).reorg_running;
     let backfill_active = backfill.active;
     let backfill_text = if backfill_active || backfill.processed > 0 {
         backfill.summary()
@@ -1284,6 +1505,43 @@ pub fn render_settings_view(
                                     core_ent.update(cx, |c, cx| c.set_album_folder_mode(mode, cx));
                                 }))
                         })),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(
+                            Button::new("tog-clean-editions")
+                                .with_variant(if cfg.clean_editions {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .xsmall()
+                                .icon(IconName::Check)
+                                .label(if cfg.clean_editions {
+                                    "Clean Editions Filter: On (skip live/demo/box-set bloat)"
+                                } else {
+                                    "Clean Editions Filter: Off"
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_clean_ed.update(cx, |c, cx| c.toggle_clean_editions(cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("settings-reorg-btn")
+                                .secondary()
+                                .xsmall()
+                                .icon(IconName::RefreshCw)
+                                .label(if reorg_running {
+                                    "Organizing…"
+                                } else {
+                                    "Organize & Clean ~/Music"
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    core_reorg.update(cx, |c, cx| c.reorganize_local_library(cx));
+                                })),
+                        ),
                 ),
         )
         .child(

@@ -2,6 +2,7 @@ mod albums;
 mod artwork;
 mod config;
 mod core;
+mod discography;
 mod downloader;
 mod instance;
 mod local_library;
@@ -80,6 +81,23 @@ fn open_vibes_window(
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--reorganize-library") {
+        let cfg = config::VibesConfig::load();
+        let backup_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("vibes-reorg-backup");
+        match local_library::reorganize_music_library(&cfg.albums_dir, &cfg.music_dir, &backup_dir) {
+            Ok(report) => {
+                println!("{}", report.summary());
+                return;
+            }
+            Err(err) => {
+                eprintln!("Library reorganization failed: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if instance::notify_existing_instance() {
         return;
     }

@@ -33,6 +33,7 @@ pub fn render_albums_view(
         albums_dir,
         folder_mode,
         audio_fmt,
+        clean_editions,
     ) = {
         let core = win.core.read(cx);
         let (active_url, active_local) = match &core.current_target {
@@ -92,6 +93,7 @@ pub fn render_albums_view(
             core.config.albums_dir.clone(),
             core.config.album_folder_mode,
             core.config.save_audio_format,
+            core.config.clean_editions,
         )
     };
 
@@ -197,12 +199,31 @@ pub fn render_albums_view(
                 active_local_path,
                 &album_downloads,
                 &albums_dir,
+                clean_editions,
                 &pal,
                 cx,
             )
             .into_any_element()
         } else {
-            render_album_results(win, results_with_art, search_loading, &pal, cx)
+            let filtered_results = if clean_editions {
+                let raw: Vec<crate::albums::AlbumSummary> =
+                    results_with_art.iter().map(|(s, _)| s.clone()).collect();
+                let clean = crate::discography::filter_clean_releases(&raw, true);
+                let mut map: std::collections::HashMap<String, Option<PathBuf>> = results_with_art
+                    .into_iter()
+                    .map(|(s, a)| (s.browse_id, a))
+                    .collect();
+                clean
+                    .into_iter()
+                    .map(|s| {
+                        let a = map.remove(&s.browse_id).flatten();
+                        (s, a)
+                    })
+                    .collect()
+            } else {
+                results_with_art
+            };
+            render_album_results(win, filtered_results, search_loading, &pal, cx)
                 .into_any_element()
         })
 }
@@ -339,9 +360,16 @@ fn render_album_detail(
     active_local_path: Option<PathBuf>,
     album_downloads: &[crate::albums::AlbumDownloadJob],
     albums_dir: &std::path::Path,
+    clean_editions: bool,
     pal: &crate::theme::Palette,
     cx: &mut Context<VibesWindow>,
 ) -> impl IntoElement {
+    let (effective_tracks, stripped_bloat) =
+        crate::discography::filter_album_tracks(&details.tracks, clean_editions);
+    let mut effective_details = details.clone();
+    effective_details.tracks = effective_tracks;
+    let details = effective_details;
+
     let pal = pal.clone();
     let core_back = win.core.clone();
     let core_play_all = win.core.clone();
@@ -423,6 +451,11 @@ fn render_album_detail(
         format!("{base_subtitle} · {local_count}/{} Local", details.tracks.len())
     } else {
         base_subtitle
+    };
+    let subtitle = if stripped_bloat > 0 {
+        format!("{subtitle} · {stripped_bloat} live/demo tracks hidden")
+    } else {
+        subtitle
     };
 
     let album_name = details.summary.title.clone();

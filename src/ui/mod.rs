@@ -1,9 +1,11 @@
 pub mod albums_view;
 pub mod art;
+pub mod discover_view;
 pub mod library_view;
 pub mod local_view;
 pub mod lyrics_view;
 pub mod player_deck;
+pub mod playlists_view;
 pub mod radio_view;
 pub mod sidebar;
 pub mod youtube_view;
@@ -29,9 +31,11 @@ pub fn register_keybindings(_cx: &mut App) {}
 pub struct VibesWindow {
     pub core: Entity<VibesCore>,
     pub radio_search_input: Entity<InputState>,
+    pub artist_search_input: Entity<InputState>,
     pub yt_search_input: Entity<InputState>,
     pub album_search_input: Entity<InputState>,
     pub local_search_input: Entity<InputState>,
+    pub playlist_name_input: Entity<InputState>,
     pub custom_name_input: Entity<InputState>,
     pub custom_url_input: Entity<InputState>,
     pub country_input: Entity<InputState>,
@@ -66,6 +70,7 @@ impl VibesWindow {
     ) -> Self {
         let cfg = core.read(cx).config.clone();
         let initial_radio_q = core.read(cx).radio_query.clone();
+        let initial_art_q = core.read(cx).artist_query.clone();
         let initial_yt_q = core.read(cx).yt_query.clone();
         let initial_alb_q = core.read(cx).album_query.clone();
         let initial_loc_q = core.read(cx).local_filter_query.clone();
@@ -74,6 +79,11 @@ impl VibesWindow {
             InputState::new(window, cx)
                 .placeholder("Search 50,000+ global radio stations (Enter)…")
                 .default_value(initial_radio_q)
+        });
+        let artist_search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search artist to Follow & Auto-Sync (e.g. Enter Shikari, Poppy)…")
+                .default_value(initial_art_q)
         });
         let yt_search_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -87,8 +97,11 @@ impl VibesWindow {
         });
         let local_search_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Filter offline albums, artists, or saved tracks…")
+                .placeholder("Filter artists, albums, or tracks…")
                 .default_value(initial_loc_q.clone())
+        });
+        let playlist_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("New playlist name (Enter)…")
         });
         let custom_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Station name (e.g. SomaFM Groove Salad)")
@@ -145,6 +158,27 @@ impl VibesWindow {
             }),
         );
 
+        let core_art = core.clone();
+        subs.push(
+            cx.subscribe_in(&artist_search_input, window, move |_, inp, ev, _, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    let q = inp.read(cx).value().to_string();
+                    core_art.update(cx, |c, cx| c.search_artists_query(q, cx));
+                }
+            }),
+        );
+
+        let core_pl = core.clone();
+        subs.push(
+            cx.subscribe_in(&playlist_name_input, window, move |_, inp, ev, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    let q = inp.read(cx).value().to_string();
+                    core_pl.update(cx, |c, cx| c.create_playlist(q, cx));
+                    inp.update(cx, |s, cx| s.set_value("", window, cx));
+                }
+            }),
+        );
+
         let core_l = core.clone();
         subs.push(
             cx.subscribe_in(&local_search_input, window, move |_, inp, ev, _, cx| {
@@ -187,9 +221,11 @@ impl VibesWindow {
         Self {
             core,
             radio_search_input,
+            artist_search_input,
             yt_search_input,
             album_search_input,
             local_search_input,
+            playlist_name_input,
             custom_name_input,
             custom_url_input,
             country_input,
@@ -264,9 +300,11 @@ impl VibesWindow {
 
     fn any_input_focused(&self, window: &Window, cx: &App) -> bool {
         self.radio_search_input.focus_handle(cx).is_focused(window)
+            || self.artist_search_input.focus_handle(cx).is_focused(window)
             || self.yt_search_input.focus_handle(cx).is_focused(window)
             || self.album_search_input.focus_handle(cx).is_focused(window)
             || self.local_search_input.focus_handle(cx).is_focused(window)
+            || self.playlist_name_input.focus_handle(cx).is_focused(window)
             || self.custom_name_input.focus_handle(cx).is_focused(window)
             || self.custom_url_input.focus_handle(cx).is_focused(window)
             || self.country_input.focus_handle(cx).is_focused(window)
@@ -315,6 +353,14 @@ impl VibesWindow {
             "l" => {
                 cx.stop_propagation();
                 self.core.update(cx, |c, cx| c.toggle_lyrics_panel(cx));
+            }
+            "s" => {
+                cx.stop_propagation();
+                self.core.update(cx, |c, cx| c.toggle_shuffle(cx));
+            }
+            "r" => {
+                cx.stop_propagation();
+                self.core.update(cx, |c, cx| c.cycle_repeat_mode(cx));
             }
             "left" => {
                 cx.stop_propagation();
@@ -492,12 +538,15 @@ impl Render for VibesWindow {
             );
 
         let main_stage = match section {
+            NavSection::Artists => local_view::render_artists_view(self, window, cx).into_any_element(),
+            NavSection::Albums => {
+                local_view::render_local_albums_view(self, window, cx).into_any_element()
+            }
+            NavSection::Playlists => playlists_view::render_playlists_view(self, cx).into_any_element(),
+            NavSection::Discover => {
+                discover_view::render_discover_view(self, window, cx).into_any_element()
+            }
             NavSection::Radio => radio_view::render_radio_view(self, window, cx).into_any_element(),
-            NavSection::Youtube => youtube_view::render_youtube_view(self, window, cx).into_any_element(),
-            NavSection::Albums => albums_view::render_albums_view(self, window, cx).into_any_element(),
-            NavSection::Library => local_view::render_local_view(self, window, cx).into_any_element(),
-            NavSection::Favorites => library_view::render_favorites_view(self, cx).into_any_element(),
-            NavSection::SongLog => library_view::render_song_log_view(self, cx).into_any_element(),
             NavSection::Queue => library_view::render_queue_view(self, cx).into_any_element(),
             NavSection::Downloads => library_view::render_downloads_view(self, cx).into_any_element(),
             NavSection::Settings => library_view::render_settings_view(self, cx).into_any_element(),

@@ -114,6 +114,8 @@ pub struct VibesConfig {
     pub albums_dir: PathBuf,
     #[serde(default)]
     pub album_folder_mode: AlbumFolderMode,
+    #[serde(default = "default_true")]
+    pub clean_editions: bool,
 }
 
 fn default_true() -> bool {
@@ -162,8 +164,120 @@ impl Default for VibesConfig {
             save_audio_format: SaveAudioFormat::Opus,
             albums_dir: default_albums_dir(),
             album_folder_mode: AlbumFolderMode::ArtistAndAlbum,
+            clean_editions: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::All => "All",
+            Self::One => "One",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum QueueItem {
+    Youtube(YoutubeItem),
+    Local(LocalTrack),
+}
+
+impl QueueItem {
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Youtube(y) => &y.title,
+            Self::Local(t) => &t.title,
+        }
+    }
+
+    pub fn subtitle(&self) -> String {
+        match self {
+            Self::Youtube(y) => y.channel.clone(),
+            Self::Local(t) => {
+                if t.album.is_empty() {
+                    t.artist.clone()
+                } else {
+                    format!("{} · {}", t.artist, t.album)
+                }
+            }
+        }
+    }
+
+    pub fn duration_secs(&self) -> Option<f64> {
+        match self {
+            Self::Youtube(y) => y.duration_secs,
+            Self::Local(t) => t.duration_secs,
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserPlaylist {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub track_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FollowedArtist {
+    pub browse_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default = "default_true")]
+    pub include_singles: bool,
+    #[serde(default = "default_true")]
+    pub clean_editions: bool,
+    #[serde(default)]
+    pub last_synced_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailedDownloadKind {
+    SingleTrack,
+    AlbumTrack,
+    ArtistSync,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailedDownloadItem {
+    pub id: String,
+    pub kind: FailedDownloadKind,
+    pub artist: String,
+    #[serde(default)]
+    pub album: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub track_number: Option<u32>,
+    #[serde(default)]
+    pub url: Option<String>,
+    pub dest_dir: PathBuf,
+    pub error: String,
+    pub failed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +309,20 @@ pub struct VibesState {
     pub recent_yt_searches: Vec<String>,
     #[serde(default)]
     pub last_played: Option<PlayTarget>,
+    #[serde(default)]
+    pub followed_artists: Vec<FollowedArtist>,
+    #[serde(default)]
+    pub failed_downloads: Vec<FailedDownloadItem>,
+    #[serde(default)]
+    pub liked_tracks: Vec<PathBuf>,
+    #[serde(default)]
+    pub playlists: Vec<UserPlaylist>,
+    #[serde(default)]
+    pub shuffle_enabled: bool,
+    #[serde(default)]
+    pub repeat_mode: RepeatMode,
+    #[serde(default)]
+    pub saved_queue: Vec<QueueItem>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -271,6 +399,7 @@ mod tests {
             save_audio_format: SaveAudioFormat::Opus,
             albums_dir: tmp.path().join("Albums"),
             album_folder_mode: AlbumFolderMode::AlbumPrefix,
+            clean_editions: true,
         };
         atomic_write_json(&cfg_file, &cfg).unwrap();
         let parsed_cfg: VibesConfig =
@@ -289,6 +418,7 @@ mod tests {
             resume_positions: HashMap::from([("vid1".to_string(), 1450.5)]),
             recent_yt_searches: vec!["ambient mix".to_string()],
             last_played: None,
+            ..Default::default()
         };
         atomic_write_json(&state_file, &state).unwrap();
         let parsed_state: VibesState =

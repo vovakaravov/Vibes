@@ -308,6 +308,24 @@ pub fn render_youtube_view(
                                                 .child(dur_badge),
                                         )
                                         .child(
+                                            Button::new(SharedString::from(format!("yt-next-{ix}")))
+                                                .ghost()
+                                                .xsmall()
+                                                .label("Next")
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    let it = item_queue.clone();
+                                                    core_queue.update(cx, |c, cx| {
+                                                        c.queue_play_next(
+                                                            crate::config::QueueItem::Youtube(it),
+                                                            cx,
+                                                        )
+                                                    });
+                                                })),
+                                        )
+                                        .child({
+                                            let core_q2 = win.core.clone();
+                                            let it_q2 = item.clone();
                                             Button::new(SharedString::from(format!("yt-q-{ix}")))
                                                 .ghost()
                                                 .xsmall()
@@ -315,12 +333,12 @@ pub fn render_youtube_view(
                                                 .label("+Queue")
                                                 .on_click(cx.listener(move |_, _, _, cx| {
                                                     cx.stop_propagation();
-                                                    let it = item_queue.clone();
-                                                    core_queue.update(cx, |c, cx| {
+                                                    let it = it_q2.clone();
+                                                    core_q2.update(cx, |c, cx| {
                                                         c.queue_youtube_item(it, cx)
                                                     });
-                                                })),
-                                        )
+                                                }))
+                                        })
                                         .when(!item.is_live, |row| {
                                             row.child(
                                                 Button::new(SharedString::from(format!(

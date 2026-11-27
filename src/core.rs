@@ -6,17 +6,24 @@ use crate::artwork::{
     ArtworkFetcher, COVER_MAX_DIM, ICON_MAX_DIM, resolve_local_album_art, trim_allocator,
     youtube_thumb_url,
 };
+pub use crate::config::QueueItem;
 use crate::config::{
-    AlbumFolderMode, PlayTarget, SaveAudioFormat, SaveFolderMode, SongLogEntry, VibesConfig,
+    AlbumFolderMode, FailedDownloadItem, FailedDownloadKind, FollowedArtist, PlayTarget,
+    RepeatMode, SaveAudioFormat, SaveFolderMode, SongLogEntry, UserPlaylist, VibesConfig,
     VibesState,
 };
+use crate::discography::{
+    ArtistDiscography, ArtistSummary, ArtistSyncStatus, fetch_artist_discography,
+    normalize_artist_key, run_artist_sync, search_artists,
+};
 use crate::downloader::{
-    DownloadJob, DownloadStatus, ParsedTrack, parse_identifiable_track, run_save_song,
+    DownloadJob, DownloadStatus, ParsedTrack, parse_identifiable_track, run_retry_failed_item,
+    run_save_song,
 };
 use crate::instance::InstanceGuard;
 use crate::local_library::{
-    LocalAlbum, LocalLibrarySnapshot, LocalTrack, find_local_album_dir, find_local_track_in_dir,
-    scan_local_library,
+    LocalAlbum, LocalArtist, LocalLibrarySnapshot, LocalTrack, ReorgReport, find_local_album_dir,
+    find_local_track_in_dir, reorganize_music_library, scan_local_library,
 };
 use crate::lyrics::{
     LyricsBackfillProgress, LyricsKind, LyricsOrigin, LyricsQuery, LyricsState,
@@ -25,7 +32,7 @@ use crate::lyrics::{
 };
 use crate::lyrics_overlay::{LyricsOverlayController, OverlayFrame};
 use crate::mpris::{MprisAction, MprisController, MprisSnapshot};
-use crate::mpv::{MpvController, MpvEvent};
+use crate::mpv::{MpvController, MpvEvent, resolve_youtube_audio_stream_url};
 use crate::radio::{
     RadioBrowserClient, RadioStation, load_cached_stations, save_cached_stations,
 };
@@ -35,64 +42,86 @@ use crate::visualizer::VisualizerController;
 use crate::youtube::{YoutubeFilter, YoutubeItem, format_duration, search_youtube};
 use chrono::Local;
 use gpui_kit::{App, ClipboardItem, Context};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NavSection {
     #[default]
-    Radio,
-    Youtube,
+    Artists,
     Albums,
-    Library,
-    Favorites,
-    SongLog,
+    Playlists,
+    Discover,
+    Radio,
     Queue,
     Downloads,
     Settings,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum QueueItem {
-    Youtube(YoutubeItem),
-    Local(LocalTrack),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiscoverTab {
+    #[default]
+    Artists,
+    Albums,
+    Tracks,
 }
 
-impl QueueItem {
-    pub fn title(&self) -> &str {
+impl DiscoverTab {
+    pub const ALL: [Self; 3] = [Self::Artists, Self::Albums, Self::Tracks];
+
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Youtube(y) => &y.title,
-            Self::Local(t) => &t.title,
+            Self::Artists => "Artists",
+            Self::Albums => "Albums",
+            Self::Tracks => "Tracks & Streams",
         }
     }
+}
 
-    pub fn subtitle(&self) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RadioTab {
+    #[default]
+    Directory,
+    Favorites,
+    SongLog,
+}
+
+impl RadioTab {
+    pub const ALL: [Self; 3] = [Self::Directory, Self::Favorites, Self::SongLog];
+
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Youtube(y) => y.channel.clone(),
-            Self::Local(t) => {
-                if t.album.is_empty() {
-                    t.artist.clone()
-                } else {
-                    format!("{} · {}", t.artist, t.album)
-                }
-            }
+            Self::Directory => "Directory",
+            Self::Favorites => "Starred Presets",
+            Self::SongLog => "Heard on Radio",
         }
     }
+}
 
-    pub fn duration_secs(&self) -> Option<f64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlbumSortMode {
+    #[default]
+    Artist,
+    Title,
+    YearDesc,
+    TrackCount,
+}
+
+impl AlbumSortMode {
+    pub const ALL: [Self; 4] = [Self::Artist, Self::Title, Self::YearDesc, Self::TrackCount];
+
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Youtube(y) => y.duration_secs,
-            Self::Local(t) => t.duration_secs,
+            Self::Artist => "Artist",
+            Self::Title => "Title",
+            Self::YearDesc => "Newest",
+            Self::TrackCount => "Tracks",
         }
-    }
-
-    pub fn is_local(&self) -> bool {
-        matches!(self, Self::Local(_))
     }
 }
 
@@ -130,6 +159,38 @@ enum CoreBgEvent {
         job_id: u64,
         status: AlbumDownloadStatus,
     },
+    AlbumDownloadFinished {
+        job_id: u64,
+        status: AlbumDownloadStatus,
+        failures: Vec<FailedDownloadItem>,
+    },
+    ArtistsSearched {
+        gen_id: u64,
+        res: Result<Vec<ArtistSummary>, String>,
+    },
+    ArtistDiscographyLoaded {
+        gen_id: u64,
+        res: Result<ArtistDiscography, String>,
+    },
+    ArtistSyncProgress(ArtistSyncStatus),
+    ArtistSyncFinished {
+        browse_id: String,
+        status: ArtistSyncStatus,
+        failures: Vec<FailedDownloadItem>,
+    },
+    FollowArtistResolved {
+        name: String,
+        res: Result<Option<ArtistSummary>, String>,
+    },
+    FailedItemRetried {
+        id: String,
+        res: Result<PathBuf, String>,
+    },
+    ReorgCompleted(Result<ReorgReport, String>),
+    StreamUrlPrefetched {
+        video_id: String,
+        res: Result<String, String>,
+    },
     LocalLibraryScanned {
         gen_id: u64,
         snapshot: LocalLibrarySnapshot,
@@ -155,6 +216,8 @@ pub struct VibesCore {
     pub state: VibesState,
     pub palette: Palette,
     pub section: NavSection,
+    pub discover_tab: DiscoverTab,
+    pub radio_tab: RadioTab,
     pub window_open: bool,
     pub compact_mode: bool,
 
@@ -174,6 +237,19 @@ pub struct VibesCore {
     pub yt_error: Option<String>,
     yt_fetch_gen: u64,
 
+    // Online Artist Discovery & Follow Sync state
+    pub artist_query: String,
+    pub artist_results: Vec<ArtistSummary>,
+    pub artist_loading: bool,
+    pub artist_error: Option<String>,
+    artist_fetch_gen: u64,
+    pub selected_online_artist: Option<ArtistDiscography>,
+    pub online_artist_loading: bool,
+    online_artist_gen: u64,
+    pub artist_sync: ArtistSyncStatus,
+    artist_sync_cancel: Option<Arc<AtomicBool>>,
+    pub artist_sync_queue: VecDeque<FollowedArtist>,
+
     // Album search & download state
     pub album_query: String,
     pub album_results: Vec<AlbumSummary>,
@@ -185,13 +261,20 @@ pub struct VibesCore {
     album_detail_gen: u64,
     pub album_downloads: Vec<AlbumDownloadJob>,
 
-    // Local offline library state
+    // Local offline library & Playlists state
     pub local_library: LocalLibrarySnapshot,
     pub local_library_loading: bool,
     local_scan_gen: u64,
     pub local_filter_query: String,
-    pub local_tab_singles: bool,
+    pub album_sort: AlbumSortMode,
+    pub selected_local_artist: Option<String>,
     pub selected_local_album: Option<PathBuf>,
+    pub selected_playlist_id: Option<String>,
+    pub reorg_running: bool,
+
+    // Stream prefetch cache (video_id -> (cdn_url, fetched_at))
+    stream_url_cache: HashMap<String, (String, Instant)>,
+    prefetching_video_ids: HashSet<String>,
 
     // Playback state
     pub current_target: Option<PlayTarget>,
@@ -359,12 +442,15 @@ impl VibesCore {
         let cached = load_cached_stations();
         let initial_vol = config.volume;
         let current_target = state.last_played.clone();
+        let initial_queue = state.saved_queue.clone();
 
         let mut core = Self {
             config,
             state,
             palette,
-            section: NavSection::Radio,
+            section: NavSection::Artists,
+            discover_tab: DiscoverTab::Artists,
+            radio_tab: RadioTab::Directory,
             window_open: true,
             compact_mode: false,
 
@@ -382,6 +468,18 @@ impl VibesCore {
             yt_error: None,
             yt_fetch_gen: 0,
 
+            artist_query: String::new(),
+            artist_results: Vec::new(),
+            artist_loading: false,
+            artist_error: None,
+            artist_fetch_gen: 0,
+            selected_online_artist: None,
+            online_artist_loading: false,
+            online_artist_gen: 0,
+            artist_sync: ArtistSyncStatus::Idle,
+            artist_sync_cancel: None,
+            artist_sync_queue: VecDeque::new(),
+
             album_query: String::new(),
             album_results: Vec::new(),
             album_loading: false,
@@ -396,8 +494,14 @@ impl VibesCore {
             local_library_loading: false,
             local_scan_gen: 0,
             local_filter_query: String::new(),
-            local_tab_singles: false,
+            album_sort: AlbumSortMode::Artist,
+            selected_local_artist: None,
             selected_local_album: None,
+            selected_playlist_id: None,
+            reorg_running: false,
+
+            stream_url_cache: HashMap::new(),
+            prefetching_video_ids: HashSet::new(),
 
             current_target,
             playing: false,
@@ -414,7 +518,7 @@ impl VibesCore {
             volume: initial_vol,
             muted: false,
             speed: 1.0,
-            queue: Vec::new(),
+            queue: initial_queue,
             queue_history: Vec::new(),
             last_prev_click_at: None,
             reconnect_attempts: 0,
@@ -559,6 +663,11 @@ impl VibesCore {
         let _ = self.state.save();
     }
 
+    fn persist_queue(&mut self) {
+        self.state.saved_queue = self.queue.clone();
+        self.persist_state();
+    }
+
     fn refresh_visualizer_state(&mut self) {
         let want_filter = self.window_open && self.config.visualizer_enabled;
         let want_anim = want_filter && self.playing && !self.paused;
@@ -629,7 +738,8 @@ impl VibesCore {
                 )
             })
             .count();
-        songs + albums
+        let sync = usize::from(self.artist_sync.is_active());
+        songs + albums + sync
     }
 
     pub fn sleep_remaining_mins(&self) -> Option<u64> {
@@ -843,19 +953,72 @@ impl VibesCore {
             self.prefetch_art_url(&u, COVER_MAX_DIM);
         }
         self.queue.push(QueueItem::Youtube(item.clone()));
+        self.persist_queue();
         self.show_toast(format!("Queued: {}", item.title), cx);
         if !self.playing && self.current_target.is_none() {
             self.play_next_in_queue(cx);
+        } else {
+            self.prefetch_next_youtube_stream(cx);
         }
         cx.notify();
     }
 
     pub fn queue_local_track(&mut self, track: LocalTrack, cx: &mut Context<Self>) {
         self.queue.push(QueueItem::Local(track.clone()));
+        self.persist_queue();
         self.show_toast(format!("Queued offline: {}", track.title), cx);
         if !self.playing && self.current_target.is_none() {
             self.play_next_in_queue(cx);
         }
+        cx.notify();
+    }
+
+    pub fn queue_play_next(&mut self, item: QueueItem, cx: &mut Context<Self>) {
+        if let QueueItem::Youtube(ref y) = item
+            && let Some(u) = youtube_thumb_url(&y.id)
+        {
+            self.prefetch_art_url(&u, COVER_MAX_DIM);
+        }
+        let title = item.title().to_string();
+        self.queue.insert(0, item);
+        self.persist_queue();
+        self.show_toast(format!("Up next: {title}"), cx);
+        if !self.playing && self.current_target.is_none() {
+            self.play_next_in_queue(cx);
+        } else {
+            self.prefetch_next_youtube_stream(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn move_queue_item(&mut self, idx: usize, delta: isize, cx: &mut Context<Self>) {
+        let new_idx = idx as isize + delta;
+        if idx < self.queue.len() && new_idx >= 0 && (new_idx as usize) < self.queue.len() {
+            self.queue.swap(idx, new_idx as usize);
+            self.persist_queue();
+            self.prefetch_next_youtube_stream(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_shuffle(&mut self, cx: &mut Context<Self>) {
+        self.state.shuffle_enabled = !self.state.shuffle_enabled;
+        self.persist_state();
+        self.show_toast(
+            if self.state.shuffle_enabled {
+                "Shuffle: On"
+            } else {
+                "Shuffle: Off"
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub fn cycle_repeat_mode(&mut self, cx: &mut Context<Self>) {
+        self.state.repeat_mode = self.state.repeat_mode.cycle();
+        self.persist_state();
+        self.show_toast(format!("Repeat: {}", self.state.repeat_mode.label()), cx);
         cx.notify();
     }
 
@@ -869,12 +1032,14 @@ impl VibesCore {
     pub fn remove_queue_index(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx < self.queue.len() {
             self.queue.remove(idx);
+            self.persist_queue();
             cx.notify();
         }
     }
 
     pub fn clear_queue(&mut self, cx: &mut Context<Self>) {
         self.queue.clear();
+        self.persist_queue();
         cx.notify();
     }
 
@@ -886,6 +1051,7 @@ impl VibesCore {
             push_queue_history(&mut self.queue_history, cur);
         }
         let item = self.queue.remove(idx);
+        self.persist_queue();
         self.play_queue_item(item, cx);
     }
 
@@ -903,9 +1069,20 @@ impl VibesCore {
     }
 
     pub fn play_next_in_queue(&mut self, cx: &mut Context<Self>) {
-        if let Some(next) =
-            step_queue_next(&self.current_target, &mut self.queue_history, &mut self.queue)
-        {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        if let Some(next) = step_queue_advance(
+            &self.current_target,
+            &mut self.queue_history,
+            &mut self.queue,
+            self.state.shuffle_enabled,
+            self.state.repeat_mode,
+            false,
+            seed,
+        ) {
+            self.persist_queue();
             self.play_queue_item(next, cx);
         } else if matches!(self.current_target, Some(PlayTarget::Radio(_)) | None) {
             self.cycle_favorite(1, cx);
@@ -931,6 +1108,7 @@ impl VibesCore {
             }
             PreviousStep::PlayTrack(prev) => {
                 self.last_prev_click_at = None;
+                self.persist_queue();
                 self.play_queue_item(prev, cx);
             }
             PreviousStep::CycleFavorite => {
@@ -938,6 +1116,30 @@ impl VibesCore {
                 self.cycle_favorite(-1, cx);
             }
         }
+    }
+
+    fn prefetch_next_youtube_stream(&mut self, cx: &Context<Self>) {
+        let next_vid = self.queue.iter().find_map(|q| match q {
+            QueueItem::Youtube(y) if !y.is_live && !y.id.is_empty() => Some((y.id.clone(), y.url.clone())),
+            _ => None,
+        });
+        let Some((vid, url)) = next_vid else {
+            return;
+        };
+        if let Some((_, fetched_at)) = self.stream_url_cache.get(&vid)
+            && fetched_at.elapsed() < Duration::from_secs(3 * 3600)
+        {
+            return;
+        }
+        if !self.prefetching_video_ids.insert(vid.clone()) {
+            return;
+        }
+        let tx = self.bg_tx.clone();
+        let _ = cx;
+        std::thread::spawn(move || {
+            let res = resolve_youtube_audio_stream_url(&url).map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::StreamUrlPrefetched { video_id: vid, res });
+        });
     }
 
     // ---- Playback Control ----
@@ -1037,15 +1239,27 @@ impl VibesCore {
         self.reconnect_attempts = 0;
         self.last_resume_save_secs = self.position_secs;
 
+        let stream_target = if !item.is_live
+            && !item.id.is_empty()
+            && let Some((cached_url, fetched_at)) = self.stream_url_cache.get(&item.id)
+            && fetched_at.elapsed() < Duration::from_secs(3 * 3600)
+        {
+            cached_url.clone()
+        } else {
+            item.url.clone()
+        };
+
         if let Some(ref mpv) = self.mpv {
             let _ = mpv.set_speed(self.speed);
-            if let Err(err) = mpv.load_url(&item.url, resume) {
+            if let Err(err) = mpv.load_url(&stream_target, resume) {
                 self.show_toast(format!("YouTube error: {err}"), cx);
             }
         }
         if let Some(r) = resume {
             self.show_toast(format!("Resumed at {}", format_duration(r)), cx);
         }
+
+        self.prefetch_next_youtube_stream(cx);
 
         self.refresh_visualizer_state();
         if self.wants_lyrics() {
@@ -1123,6 +1337,7 @@ impl VibesCore {
             .cloned()
             .map(QueueItem::Local)
             .collect();
+        self.persist_queue();
         self.play_local_track(first, cx);
     }
 
@@ -1142,6 +1357,53 @@ impl VibesCore {
         cx: &mut Context<Self>,
     ) {
         self.play_local_list_from(tracks, start_idx, cx);
+    }
+
+    pub fn play_tracks_shuffled(&mut self, mut tracks: Vec<LocalTrack>, cx: &mut Context<Self>) {
+        if tracks.is_empty() {
+            return;
+        }
+        shuffle_slice(&mut tracks);
+        self.state.shuffle_enabled = true;
+        self.persist_state();
+        self.play_local_list_from(&tracks, 0, cx);
+    }
+
+    pub fn play_artist_all(&mut self, artist: &LocalArtist, shuffled: bool, cx: &mut Context<Self>) {
+        let all: Vec<LocalTrack> = artist
+            .albums
+            .iter()
+            .flat_map(|a| a.tracks.iter().cloned())
+            .chain(artist.singles.iter().cloned())
+            .collect();
+        if all.is_empty() {
+            return;
+        }
+        if shuffled {
+            self.play_tracks_shuffled(all, cx);
+        } else {
+            self.play_local_list_from(&all, 0, cx);
+        }
+    }
+
+    pub fn jump_to_artist_by_name(&mut self, artist_name: &str, cx: &mut Context<Self>) {
+        let want = normalize_artist_key(artist_name);
+        if want.is_empty() {
+            return;
+        }
+        self.section = NavSection::Artists;
+        self.selected_local_album = None;
+        if let Some(hit) = self
+            .local_library
+            .artists
+            .iter()
+            .find(|a| a.key == want || normalize_artist_key(&a.name) == want)
+        {
+            self.selected_local_artist = Some(hit.key.clone());
+        } else {
+            self.selected_local_artist = Some(want);
+        }
+        cx.notify();
     }
 
     pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
@@ -1529,15 +1791,13 @@ impl VibesCore {
         self.show_toast(format!("Saving {label} to Music…"), cx);
         self.sync_integrations();
 
-        let music_dir = self.config.music_dir.clone();
-        let folder_mode = self.config.save_folder_mode;
+        let albums_dir = self.config.albums_dir.clone();
         let format = self.config.save_audio_format;
         let tx = self.bg_tx.clone();
 
         std::thread::spawn(move || {
             run_save_song(
-                &music_dir,
-                folder_mode,
+                &albums_dir,
                 format,
                 &parsed,
                 &source_station,
@@ -1548,6 +1808,87 @@ impl VibesCore {
             );
         });
         cx.notify();
+    }
+
+    pub fn retry_failed_download(&mut self, failed_id: String, cx: &mut Context<Self>) {
+        let Some(item) = self
+            .state
+            .failed_downloads
+            .iter()
+            .find(|f| f.id == failed_id)
+            .cloned()
+        else {
+            return;
+        };
+        if item.url.is_none() {
+            let parsed = ParsedTrack {
+                artist: (!item.artist.trim().is_empty()).then(|| item.artist.clone()),
+                title: item.title.clone(),
+                display: format!("{} - {}", item.artist, item.title),
+            };
+            self.state.failed_downloads.retain(|f| f.id != failed_id);
+            self.persist_state();
+            self.enqueue_save_job(parsed, None, String::new(), cx);
+            return;
+        }
+        self.show_toast(format!("Retrying {}…", item.title), cx);
+        let albums_dir = self.config.albums_dir.clone();
+        let format = self.config.save_audio_format;
+        let tx = self.bg_tx.clone();
+        let fid = item.id.clone();
+        std::thread::spawn(move || {
+            let res = run_retry_failed_item(&item, &albums_dir, format).map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::FailedItemRetried { id: fid, res });
+        });
+        cx.notify();
+    }
+
+    pub fn retry_all_failed_downloads(&mut self, cx: &mut Context<Self>) {
+        let items = self.state.failed_downloads.clone();
+        if items.is_empty() {
+            return;
+        }
+        self.show_toast(format!("Retrying {} failed downloads…", items.len()), cx);
+        let albums_dir = self.config.albums_dir.clone();
+        let format = self.config.save_audio_format;
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            for item in items {
+                let fid = item.id.clone();
+                let res =
+                    run_retry_failed_item(&item, &albums_dir, format).map_err(|e| format!("{e}"));
+                let _ = tx.send_blocking(CoreBgEvent::FailedItemRetried { id: fid, res });
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn dismiss_failed_download(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.state.failed_downloads.retain(|f| f.id != id);
+        self.persist_state();
+        self.sync_integrations();
+        cx.notify();
+    }
+
+    pub fn clear_failed_downloads(&mut self, cx: &mut Context<Self>) {
+        self.state.failed_downloads.clear();
+        self.persist_state();
+        self.sync_integrations();
+        cx.notify();
+    }
+
+    fn record_failed_downloads(&mut self, items: Vec<FailedDownloadItem>) {
+        if items.is_empty() {
+            return;
+        }
+        for item in items {
+            self.state
+                .failed_downloads
+                .retain(|f| !(f.artist.eq_ignore_ascii_case(&item.artist) && f.title.eq_ignore_ascii_case(&item.title)));
+            self.state.failed_downloads.insert(0, item);
+        }
+        self.state.failed_downloads.truncate(150);
+        self.persist_state();
     }
 
     pub fn copy_current_track(&mut self, cx: &mut Context<Self>) {
@@ -1909,6 +2250,197 @@ impl VibesCore {
         cx.notify();
     }
 
+    pub fn toggle_clean_editions(&mut self, cx: &mut Context<Self>) {
+        self.config.clean_editions = !self.config.clean_editions;
+        self.persist_config();
+        self.show_toast(
+            if self.config.clean_editions {
+                "Clean Editions: On (skips live/demo/box-set bloat)"
+            } else {
+                "Clean Editions: Off (shows all editions)"
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub fn reorganize_local_library(&mut self, cx: &mut Context<Self>) {
+        if self.reorg_running {
+            return;
+        }
+        self.reorg_running = true;
+        self.show_toast("Reorganizing ~/Music & backing up duplicates…", cx);
+        let albums_dir = self.config.albums_dir.clone();
+        let radio_dir = self.config.music_dir.clone();
+        let backup_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("vibes-reorg-backup");
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let res = reorganize_music_library(&albums_dir, &radio_dir, &backup_dir)
+                .map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::ReorgCompleted(res));
+        });
+        cx.notify();
+    }
+
+    // ---- Liked Tracks & User Playlists ----
+
+    pub fn is_track_liked(&self, path: &Path) -> bool {
+        self.state.liked_tracks.iter().any(|p| p == path)
+    }
+
+    pub fn toggle_like_track(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(pos) = self.state.liked_tracks.iter().position(|p| p == &path) {
+            self.state.liked_tracks.remove(pos);
+            self.show_toast("Removed from Liked Songs", cx);
+        } else {
+            self.state.liked_tracks.insert(0, path);
+            self.show_toast("Added to Liked Songs", cx);
+        }
+        self.persist_state();
+        cx.notify();
+    }
+
+    pub fn create_playlist(&mut self, raw_name: String, cx: &mut Context<Self>) {
+        let name = raw_name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let id = format!(
+            "pl-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        self.state.playlists.push(UserPlaylist {
+            id: id.clone(),
+            name: name.clone(),
+            track_paths: Vec::new(),
+        });
+        self.selected_playlist_id = Some(id);
+        self.persist_state();
+        self.show_toast(format!("Created playlist '{name}'"), cx);
+        cx.notify();
+    }
+
+    pub fn delete_playlist(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.state.playlists.retain(|p| p.id != id);
+        if self.selected_playlist_id.as_deref() == Some(id) {
+            self.selected_playlist_id = None;
+        }
+        self.persist_state();
+        cx.notify();
+    }
+
+    pub fn add_track_to_playlist(&mut self, playlist_id: &str, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(pl) = self.state.playlists.iter_mut().find(|p| p.id == playlist_id) else {
+            return;
+        };
+        if !pl.track_paths.contains(&path) {
+            pl.track_paths.push(path);
+            let name = pl.name.clone();
+            self.persist_state();
+            self.show_toast(format!("Added to '{name}'"), cx);
+        } else {
+            self.show_toast("Track is already in playlist", cx);
+        }
+        cx.notify();
+    }
+
+    pub fn remove_track_from_playlist(&mut self, playlist_id: &str, idx: usize, cx: &mut Context<Self>) {
+        if let Some(pl) = self.state.playlists.iter_mut().find(|p| p.id == playlist_id)
+            && idx < pl.track_paths.len()
+        {
+            pl.track_paths.remove(idx);
+            self.persist_state();
+            cx.notify();
+        }
+    }
+
+    pub fn save_queue_as_playlist(&mut self, raw_name: String, cx: &mut Context<Self>) {
+        let mut paths = Vec::new();
+        if let Some(PlayTarget::Local(t)) = &self.current_target {
+            paths.push(t.path.clone());
+        }
+        for q in &self.queue {
+            if let QueueItem::Local(t) = q
+                && !paths.contains(&t.path)
+            {
+                paths.push(t.path.clone());
+            }
+        }
+        if paths.is_empty() {
+            self.show_toast("No offline tracks in current queue to save", cx);
+            return;
+        }
+        let name = if raw_name.trim().is_empty() {
+            format!("Mix {}", Local::now().format("%b %d %H:%M"))
+        } else {
+            raw_name.trim().to_string()
+        };
+        let id = format!(
+            "pl-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        self.state.playlists.push(UserPlaylist {
+            id: id.clone(),
+            name: name.clone(),
+            track_paths: paths,
+        });
+        self.selected_playlist_id = Some(id);
+        self.persist_state();
+        self.show_toast(format!("Saved queue as '{name}'"), cx);
+        cx.notify();
+    }
+
+    pub fn resolve_tracks_by_paths(&self, paths: &[PathBuf]) -> Vec<LocalTrack> {
+        let mut by_path: HashMap<&Path, &LocalTrack> = HashMap::new();
+        for alb in &self.local_library.albums {
+            for t in &alb.tracks {
+                by_path.insert(t.path.as_path(), t);
+            }
+        }
+        for s in &self.local_library.singles {
+            by_path.insert(s.path.as_path(), s);
+        }
+        paths
+            .iter()
+            .filter_map(|p| by_path.get(p.as_path()).map(|t| (*t).clone()))
+            .collect()
+    }
+
+    pub fn play_liked_songs(&mut self, start_idx: usize, shuffled: bool, cx: &mut Context<Self>) {
+        let tracks = self.resolve_tracks_by_paths(&self.state.liked_tracks);
+        if shuffled {
+            self.play_tracks_shuffled(tracks, cx);
+        } else {
+            self.play_local_list_from(&tracks, start_idx, cx);
+        }
+    }
+
+    pub fn play_playlist(
+        &mut self,
+        playlist_id: &str,
+        start_idx: usize,
+        shuffled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(paths) = self
+            .state
+            .playlists
+            .iter()
+            .find(|p| p.id == playlist_id)
+            .map(|p| p.track_paths.clone())
+        else {
+            return;
+        };
+        let tracks = self.resolve_tracks_by_paths(&paths);
+        if shuffled {
+            self.play_tracks_shuffled(tracks, cx);
+        } else {
+            self.play_local_list_from(&tracks, start_idx, cx);
+        }
+    }
+
     pub fn set_music_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.config.music_dir = dir;
         self.persist_config();
@@ -1925,10 +2457,6 @@ impl VibesCore {
         self.config.save_audio_format = fmt;
         self.persist_config();
         cx.notify();
-    }
-
-    pub fn open_music_folder(&self) {
-        self.open_folder(&self.config.music_dir);
     }
 
     pub fn open_folder(&self, path: &std::path::Path) {
@@ -1976,16 +2504,195 @@ impl VibesCore {
         }
     }
 
-    pub fn set_local_tab_singles(&mut self, singles: bool, cx: &mut Context<Self>) {
-        if self.local_tab_singles != singles {
-            self.local_tab_singles = singles;
+    pub fn set_album_sort(&mut self, sort: AlbumSortMode, cx: &mut Context<Self>) {
+        if self.album_sort != sort {
+            self.album_sort = sort;
             cx.notify();
         }
+    }
+
+    pub fn select_local_artist(&mut self, key: Option<String>, cx: &mut Context<Self>) {
+        self.selected_local_artist = key;
+        self.selected_local_album = None;
+        cx.notify();
     }
 
     pub fn select_local_album(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
         self.selected_local_album = folder;
         cx.notify();
+    }
+
+    // ---- Artist Discovery, Follow & Auto-Sync ----
+
+    pub fn followed_entry_for_name(&self, name: &str) -> Option<&FollowedArtist> {
+        let want_key = normalize_artist_key(name);
+        self.state
+            .followed_artists
+            .iter()
+            .find(|f| !want_key.is_empty() && normalize_artist_key(&f.name) == want_key)
+    }
+
+    pub fn search_artists_query(&mut self, query: String, cx: &mut Context<Self>) {
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.artist_query = q.clone();
+        self.selected_online_artist = None;
+        self.artist_loading = true;
+        self.artist_error = None;
+        self.artist_fetch_gen = self.artist_fetch_gen.wrapping_add(1);
+        let gen_id = self.artist_fetch_gen;
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let res = search_artists(&q).map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::ArtistsSearched { gen_id, res });
+        });
+        cx.notify();
+    }
+
+    pub fn select_online_artist(&mut self, summary: ArtistSummary, cx: &mut Context<Self>) {
+        self.online_artist_loading = true;
+        self.artist_error = None;
+        self.online_artist_gen = self.online_artist_gen.wrapping_add(1);
+        let gen_id = self.online_artist_gen;
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let res = fetch_artist_discography(&summary).map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::ArtistDiscographyLoaded { gen_id, res });
+        });
+        cx.notify();
+    }
+
+    pub fn clear_selected_online_artist(&mut self, cx: &mut Context<Self>) {
+        self.selected_online_artist = None;
+        self.online_artist_loading = false;
+        cx.notify();
+    }
+
+    pub fn follow_artist_summary(&mut self, summary: ArtistSummary, cx: &mut Context<Self>) {
+        if let Some(existing) = self
+            .state
+            .followed_artists
+            .iter()
+            .find(|f| f.browse_id == summary.browse_id)
+            .cloned()
+        {
+            self.enqueue_artist_sync(existing, cx);
+            return;
+        }
+        let followed = FollowedArtist {
+            browse_id: summary.browse_id.clone(),
+            name: summary.name.clone(),
+            avatar_url: summary.avatar_url.clone(),
+            include_singles: true,
+            clean_editions: self.config.clean_editions,
+            last_synced_at: None,
+        };
+        if let Some(ref url) = followed.avatar_url {
+            self.prefetch_art_url(url, COVER_MAX_DIM);
+        }
+        self.state.followed_artists.push(followed.clone());
+        self.persist_state();
+        self.show_toast(format!("Following {} · Starting auto-sync…", followed.name), cx);
+        self.enqueue_artist_sync(followed, cx);
+        cx.notify();
+    }
+
+    pub fn follow_local_artist(&mut self, artist_name: String, cx: &mut Context<Self>) {
+        if let Some(existing) = self.followed_entry_for_name(&artist_name).cloned() {
+            self.enqueue_artist_sync(existing, cx);
+            return;
+        }
+        self.show_toast(format!("Finding {artist_name} on YouTube Music…"), cx);
+        let name = artist_name.clone();
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let res = search_artists(&name)
+                .map(|list| list.into_iter().next())
+                .map_err(|e| format!("{e}"));
+            let _ = tx.send_blocking(CoreBgEvent::FollowArtistResolved { name, res });
+        });
+    }
+
+    pub fn unfollow_artist(&mut self, browse_id_or_name: &str, cx: &mut Context<Self>) {
+        let want_key = normalize_artist_key(browse_id_or_name);
+        self.state.followed_artists.retain(|f| {
+            f.browse_id != browse_id_or_name && normalize_artist_key(&f.name) != want_key
+        });
+        self.persist_state();
+        self.show_toast("Unfollowed artist", cx);
+        cx.notify();
+    }
+
+    pub fn sync_all_followed_artists(&mut self, cx: &mut Context<Self>) {
+        if self.state.followed_artists.is_empty() {
+            self.show_toast("No followed artists yet · Follow an artist first", cx);
+            return;
+        }
+        let list = self.state.followed_artists.clone();
+        for f in list {
+            if !self
+                .artist_sync_queue
+                .iter()
+                .any(|q| q.browse_id == f.browse_id)
+            {
+                self.artist_sync_queue.push_back(f);
+            }
+        }
+        self.start_next_artist_sync(cx);
+    }
+
+    pub fn enqueue_artist_sync(&mut self, artist: FollowedArtist, cx: &mut Context<Self>) {
+        if !self
+            .artist_sync_queue
+            .iter()
+            .any(|q| q.browse_id == artist.browse_id)
+        {
+            self.artist_sync_queue.push_back(artist);
+        }
+        self.start_next_artist_sync(cx);
+    }
+
+    fn start_next_artist_sync(&mut self, cx: &mut Context<Self>) {
+        if self.artist_sync.is_active() {
+            return;
+        }
+        let Some(mut next) = self.artist_sync_queue.pop_front() else {
+            cx.notify();
+            return;
+        };
+        next.clean_editions = self.config.clean_editions;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.artist_sync_cancel = Some(Arc::clone(&cancel));
+        self.artist_sync = ArtistSyncStatus::FetchingDiscography {
+            artist: next.name.clone(),
+        };
+        let albums_dir = self.config.albums_dir.clone();
+        let format = self.config.save_audio_format;
+        let tx = self.bg_tx.clone();
+        let browse_id = next.browse_id.clone();
+
+        std::thread::spawn(move || {
+            let (status, failures) = run_artist_sync(&albums_dir, format, &next, cancel, |st| {
+                let _ = tx.send_blocking(CoreBgEvent::ArtistSyncProgress(st));
+            });
+            let _ = tx.send_blocking(CoreBgEvent::ArtistSyncFinished {
+                browse_id,
+                status,
+                failures,
+            });
+        });
+        self.sync_integrations();
+        cx.notify();
+    }
+
+    pub fn cancel_artist_sync(&mut self, cx: &mut Context<Self>) {
+        self.artist_sync_queue.clear();
+        if let Some(ref cancel) = self.artist_sync_cancel {
+            cancel.store(true, Ordering::Release);
+            self.show_toast("Cancelling artist sync…", cx);
+        }
     }
 
     // ---- Official Album Search, Playback & Full Download ----
@@ -2191,11 +2898,21 @@ impl VibesCore {
         let albums_dir = self.config.albums_dir.clone();
         let mode = self.config.album_folder_mode;
         let format = self.config.save_audio_format;
+        let clean_editions = self.config.clean_editions;
         let tx = self.bg_tx.clone();
 
         std::thread::spawn(move || {
-            run_download_album(&albums_dir, mode, format, &details, |status| {
-                let _ = tx.send_blocking(CoreBgEvent::AlbumDownloadProgress { job_id, status });
+            let (status, failures) =
+                run_download_album(&albums_dir, mode, format, &details, clean_editions, |st| {
+                    let _ = tx.send_blocking(CoreBgEvent::AlbumDownloadProgress {
+                        job_id,
+                        status: st,
+                    });
+                });
+            let _ = tx.send_blocking(CoreBgEvent::AlbumDownloadFinished {
+                job_id,
+                status,
+                failures,
             });
         });
         cx.notify();
@@ -2377,8 +3094,21 @@ impl VibesCore {
                                 self.state.resume_positions.remove(&yt.id);
                                 self.persist_state();
                             }
-                            if !self.queue.is_empty() {
-                                self.play_next_in_queue(cx);
+                            let seed = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.subsec_nanos() as usize)
+                                .unwrap_or(0);
+                            if let Some(next) = step_queue_advance(
+                                &self.current_target,
+                                &mut self.queue_history,
+                                &mut self.queue,
+                                self.state.shuffle_enabled,
+                                self.state.repeat_mode,
+                                true,
+                                seed,
+                            ) {
+                                self.persist_queue();
+                                self.play_queue_item(next, cx);
                                 return;
                             }
                             self.playing = false;
@@ -2605,6 +3335,19 @@ impl VibesCore {
                 }
             }
             CoreBgEvent::AlbumDownloadProgress { job_id, status } => {
+                if let Some(job) = self.album_downloads.iter_mut().find(|j| j.id == job_id) {
+                    job.status = status;
+                }
+                self.sync_integrations();
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::AlbumDownloadFinished {
+                job_id,
+                status,
+                failures,
+            } => {
                 let title = self
                     .album_downloads
                     .iter()
@@ -2613,6 +3356,9 @@ impl VibesCore {
                     .unwrap_or_default();
                 if let Some(job) = self.album_downloads.iter_mut().find(|j| j.id == job_id) {
                     job.status = status.clone();
+                }
+                if !failures.is_empty() {
+                    self.record_failed_downloads(failures);
                 }
                 match status {
                     AlbumDownloadStatus::Completed {
@@ -2635,6 +3381,156 @@ impl VibesCore {
                 self.sync_integrations();
                 if self.window_open {
                     cx.notify();
+                }
+            }
+            CoreBgEvent::ArtistsSearched { gen_id, res } => {
+                if gen_id != self.artist_fetch_gen {
+                    return;
+                }
+                self.artist_loading = false;
+                match res {
+                    Ok(list) => {
+                        self.artist_error = None;
+                        for a in &list {
+                            if let Some(ref url) = a.avatar_url {
+                                self.prefetch_art_url(url, COVER_MAX_DIM);
+                            }
+                        }
+                        self.artist_results = list;
+                    }
+                    Err(err) => {
+                        self.artist_error = Some(err);
+                    }
+                }
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::ArtistDiscographyLoaded { gen_id, res } => {
+                if gen_id != self.online_artist_gen {
+                    return;
+                }
+                self.online_artist_loading = false;
+                match res {
+                    Ok(disco) => {
+                        self.artist_error = None;
+                        if let Some(ref url) = disco.artist.avatar_url {
+                            self.prefetch_art_url(url, COVER_MAX_DIM);
+                        }
+                        for r in disco.albums.iter().chain(disco.singles_and_eps.iter()) {
+                            if let Some(ref url) = r.cover_url {
+                                self.prefetch_art_url(url, COVER_MAX_DIM);
+                            }
+                        }
+                        self.selected_online_artist = Some(disco);
+                    }
+                    Err(err) => {
+                        self.artist_error = Some(err);
+                    }
+                }
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::ArtistSyncProgress(st) => {
+                self.artist_sync = st;
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::ArtistSyncFinished {
+                browse_id,
+                status,
+                failures,
+            } => {
+                self.artist_sync_cancel = None;
+                self.artist_sync = status.clone();
+                if let Some(f) = self
+                    .state
+                    .followed_artists
+                    .iter_mut()
+                    .find(|x| x.browse_id == browse_id)
+                {
+                    f.last_synced_at = Some(Local::now().format("%Y-%m-%d %H:%M").to_string());
+                }
+                if !failures.is_empty() {
+                    self.record_failed_downloads(failures);
+                } else {
+                    self.persist_state();
+                }
+                self.show_toast(status.summary_line(), cx);
+                self.refresh_local_library(cx);
+                self.sync_integrations();
+                if !self.artist_sync_queue.is_empty()
+                    && !matches!(status, ArtistSyncStatus::Cancelled { .. })
+                {
+                    self.start_next_artist_sync(cx);
+                } else if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::FollowArtistResolved { name, res } => match res {
+                Ok(Some(summary)) => {
+                    self.follow_artist_summary(summary, cx);
+                }
+                Ok(None) => {
+                    self.show_toast(format!("Could not find artist '{name}' on YouTube Music"), cx);
+                }
+                Err(err) => {
+                    self.show_toast(format!("Artist search failed: {err}"), cx);
+                }
+            },
+            CoreBgEvent::FailedItemRetried { id, res } => {
+                match res {
+                    Ok(path) => {
+                        self.state.failed_downloads.retain(|f| f.id != id);
+                        self.persist_state();
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("Track");
+                        self.show_toast(format!("Recovered: {name}"), cx);
+                        self.refresh_local_library(cx);
+                    }
+                    Err(err) => {
+                        if let Some(item) =
+                            self.state.failed_downloads.iter_mut().find(|f| f.id == id)
+                        {
+                            item.error = err.clone();
+                            item.failed_at = Local::now().format("%Y-%m-%d %H:%M").to_string();
+                        }
+                        self.persist_state();
+                        self.show_toast(format!("Retry failed: {err}"), cx);
+                    }
+                }
+                self.sync_integrations();
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::ReorgCompleted(res) => {
+                self.reorg_running = false;
+                match res {
+                    Ok(report) => {
+                        self.show_toast(report.summary(), cx);
+                        self.refresh_local_library(cx);
+                    }
+                    Err(err) => {
+                        self.show_toast(format!("Library organize error: {err}"), cx);
+                    }
+                }
+                if self.window_open {
+                    cx.notify();
+                }
+            }
+            CoreBgEvent::StreamUrlPrefetched { video_id, res } => {
+                self.prefetching_video_ids.remove(&video_id);
+                if let Ok(cdn_url) = res {
+                    if self.stream_url_cache.len() >= 32 {
+                        self.stream_url_cache.clear();
+                    }
+                    self.stream_url_cache
+                        .insert(video_id, (cdn_url, Instant::now()));
                 }
             }
             CoreBgEvent::LocalLibraryScanned { gen_id, snapshot } => {
@@ -2714,6 +3610,21 @@ impl VibesCore {
                         self.show_toast(format!("Already in library: {name}"), cx);
                     }
                     DownloadStatus::Failed(ref err) => {
+                        if let Some(job) = self.downloads.iter().find(|j| j.id == job_id).cloned() {
+                            let dest_dir = self.config.albums_dir.clone();
+                            self.record_failed_downloads(vec![FailedDownloadItem {
+                                id: format!("sng-{job_id}"),
+                                kind: FailedDownloadKind::SingleTrack,
+                                artist: job.parsed.artist.clone().unwrap_or_else(|| "Unknown Artist".to_string()),
+                                album: None,
+                                title: job.parsed.title.clone(),
+                                track_number: None,
+                                url: job.direct_url.clone(),
+                                dest_dir,
+                                error: err.clone(),
+                                failed_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
+                            }]);
+                        }
                         self.show_toast(format!("Save failed: {err}"), cx);
                     }
                     DownloadStatus::Searching | DownloadStatus::Downloading(_) => {}
@@ -2806,18 +3717,80 @@ fn push_queue_history(history: &mut Vec<QueueItem>, item: QueueItem) {
     }
 }
 
+fn shuffle_slice<T>(items: &mut [T]) {
+    if items.len() <= 1 {
+        return;
+    }
+    let mut state = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    if state == 0 {
+        state = 0x517c_c1b7_2722_0a95;
+    }
+    for i in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state as usize) % (i + 1);
+        items.swap(i, j);
+    }
+}
+
+fn step_queue_advance(
+    current: &Option<PlayTarget>,
+    history: &mut Vec<QueueItem>,
+    queue: &mut Vec<QueueItem>,
+    shuffle_enabled: bool,
+    repeat_mode: RepeatMode,
+    is_eof: bool,
+    seed: usize,
+) -> Option<QueueItem> {
+    if is_eof
+        && repeat_mode == RepeatMode::One
+        && let Some(cur) = target_as_queue_item(current)
+    {
+        return Some(cur);
+    }
+
+    if !queue.is_empty() {
+        if let Some(cur) = target_as_queue_item(current) {
+            push_queue_history(history, cur);
+        }
+        let pick_idx = if shuffle_enabled {
+            seed % queue.len()
+        } else {
+            0
+        };
+        return Some(queue.remove(pick_idx));
+    }
+
+    if repeat_mode == RepeatMode::All {
+        let mut pool = Vec::new();
+        pool.append(history);
+        if let Some(cur) = target_as_queue_item(current) {
+            pool.push(cur);
+        }
+        if !pool.is_empty() {
+            if shuffle_enabled {
+                shuffle_slice(&mut pool);
+            }
+            let first = pool.remove(0);
+            *queue = pool;
+            return Some(first);
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
 fn step_queue_next(
     current: &Option<PlayTarget>,
     history: &mut Vec<QueueItem>,
     queue: &mut Vec<QueueItem>,
 ) -> Option<QueueItem> {
-    if queue.is_empty() {
-        return None;
-    }
-    if let Some(cur) = target_as_queue_item(current) {
-        push_queue_history(history, cur);
-    }
-    Some(queue.remove(0))
+    step_queue_advance(current, history, queue, false, RepeatMode::Off, false, 0)
 }
 
 fn step_queue_previous(
@@ -3045,6 +4018,57 @@ mod tests {
             step_queue_previous(&None, 0.0, false, &mut history, &mut queue),
             PreviousStep::CycleFavorite
         );
+    }
+
+    #[test]
+    fn shuffle_and_repeat_modes_behave_correctly() {
+        let t1 = QueueItem::Local(dummy_track(1));
+        let t2 = QueueItem::Local(dummy_track(2));
+        let t3 = QueueItem::Local(dummy_track(3));
+        let current = as_target(&t1);
+        let mut history = Vec::new();
+        let mut queue = vec![t2.clone(), t3.clone()];
+
+        // Repeat One replays current track on EOF without draining queue
+        let rep1 = step_queue_advance(
+            &current,
+            &mut history,
+            &mut queue,
+            false,
+            RepeatMode::One,
+            true,
+            0,
+        );
+        assert_eq!(rep1, Some(t1.clone()));
+        assert_eq!(queue.len(), 2);
+
+        // Shuffle picks within queue using seed
+        let shuf = step_queue_advance(
+            &current,
+            &mut history,
+            &mut queue,
+            true,
+            RepeatMode::Off,
+            true,
+            1,
+        );
+        assert_eq!(shuf, Some(t3.clone()));
+        assert_eq!(queue, vec![t2.clone()]);
+
+        // Repeat All recycles history + current when queue empties
+        history.push(t2.clone());
+        let mut empty_q = Vec::new();
+        let wrapped = step_queue_advance(
+            &as_target(&t3),
+            &mut history,
+            &mut empty_q,
+            false,
+            RepeatMode::All,
+            true,
+            0,
+        );
+        assert_eq!(wrapped, Some(t1));
+        assert_eq!(empty_q.len(), 2);
     }
 
     #[test]

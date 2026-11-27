@@ -1,4 +1,6 @@
-use crate::config::{SaveAudioFormat, SaveFolderMode};
+use crate::config::{FailedDownloadItem, SaveAudioFormat};
+use crate::discography::find_canonical_artist_dir;
+use crate::local_library::{artist_has_track, normalize_match_key};
 use crate::youtube::{YoutubeItem, parse_ytdlp_ndjson};
 use anyhow::{Context, Result};
 use lofty::config::WriteOptions;
@@ -264,23 +266,6 @@ pub fn pick_best_youtube_audio_match(
     best.map(|(_, item)| item.clone())
 }
 
-pub fn resolve_destination(
-    music_dir: &Path,
-    folder_mode: SaveFolderMode,
-    format: SaveAudioFormat,
-    parsed: &ParsedTrack,
-) -> (PathBuf, String, PathBuf) {
-    let dest_dir = match (folder_mode, parsed.artist.as_deref()) {
-        (SaveFolderMode::ByArtist, Some(artist)) if !artist.trim().is_empty() => {
-            music_dir.join(sanitize_filename(artist))
-        }
-        _ => music_dir.to_path_buf(),
-    };
-    let clean_name = sanitize_filename(&parsed.display);
-    let final_path = dest_dir.join(format!("{clean_name}.{}", format.extension()));
-    (dest_dir, clean_name, final_path)
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct YtInfoMetadata {
     #[serde(default)]
@@ -483,6 +468,35 @@ pub fn write_tags_and_cover(
     Ok(())
 }
 
+/// Retries `extract_ytdlp_audio` once after a short backoff and removes partial leftovers on failure.
+pub fn extract_ytdlp_audio_with_retry(
+    url: &str,
+    dest_dir: &Path,
+    clean_name: &str,
+    format: SaveAudioFormat,
+    write_sidecars: bool,
+) -> Result<PathBuf> {
+    match extract_ytdlp_audio(url, dest_dir, clean_name, format, write_sidecars) {
+        Ok(p) => Ok(p),
+        Err(_first_err) => {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let res = extract_ytdlp_audio(url, dest_dir, clean_name, format, write_sidecars);
+            if res.is_err() {
+                if let Ok(entries) = fs::read_dir(dest_dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                        if fname.starts_with(clean_name) && fname.ends_with(".part") {
+                            let _ = fs::remove_file(&p);
+                        }
+                    }
+                }
+            }
+            res
+        }
+    }
+}
+
 /// Runs `yt-dlp` to extract clean audio in `format` into `dest_dir/<clean_name>.<ext>`.
 pub fn extract_ytdlp_audio(
     url: &str,
@@ -584,15 +598,14 @@ pub fn apply_rich_metadata_and_cover(
         .or_else(|| channel_fallback.clone());
 
     let station_clean = radio_station.map(str::trim).filter(|s| !s.is_empty());
+    let title_key = normalize_match_key(&title);
     let album = info
         .and_then(|i| non_empty(i.album.as_ref()))
-        .or_else(|| {
-            station_clean.and_then(|st| {
-                let same_as_artist = artist
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(st));
-                (!same_as_artist).then(|| st.to_string())
-            })
+        .filter(|alb| {
+            let ak = normalize_match_key(alb);
+            !ak.is_empty()
+                && ak != title_key
+                && !station_clean.is_some_and(|st| st.eq_ignore_ascii_case(alb))
         });
 
     let genre = info
@@ -695,28 +708,90 @@ fn find_and_clean_sidecars(
     (info, cover_jpg)
 }
 
+fn move_audio_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    fs::copy(src, dst)?;
+    let _ = fs::remove_file(src);
+    Ok(())
+}
+
+fn find_matching_album_dir(artist_dir: &Path, album: &str) -> PathBuf {
+    let clean_alb = sanitize_filename(album);
+    let exact = artist_dir.join(&clean_alb);
+    if exact.is_dir() {
+        return exact;
+    }
+    let want = normalize_match_key(album);
+    if !want.is_empty()
+        && let Ok(entries) = fs::read_dir(artist_dir)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir()
+                && let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && !name.eq_ignore_ascii_case("singles")
+                && normalize_match_key(name) == want
+            {
+                return p;
+            }
+        }
+    }
+    exact
+}
+
+pub fn resolve_song_destination_from_meta(
+    albums_dir: &Path,
+    artist: &str,
+    album: Option<&str>,
+    title: &str,
+    radio_station: Option<&str>,
+    ext: &str,
+) -> (PathBuf, PathBuf) {
+    let artist_dir = find_canonical_artist_dir(albums_dir, artist);
+    let clean_title = sanitize_filename(title);
+    let title_key = normalize_match_key(title);
+    let real_album = album
+        .map(str::trim)
+        .filter(|alb| !alb.is_empty())
+        .filter(|alb| {
+            let ak = normalize_match_key(alb);
+            !ak.is_empty()
+                && ak != title_key
+                && !alb.eq_ignore_ascii_case("singles")
+                && !alb.to_lowercase().contains("radio")
+                && !alb.to_lowercase().contains(".fm")
+                && !radio_station.is_some_and(|st| st.eq_ignore_ascii_case(alb))
+        });
+
+    let dest_dir = match real_album {
+        Some(alb) => find_matching_album_dir(&artist_dir, alb),
+        None => artist_dir.join("Singles"),
+    };
+    let final_path = dest_dir.join(format!("{clean_title}.{ext}"));
+    (dest_dir, final_path)
+}
+
 pub fn run_save_song(
-    music_dir: &Path,
-    folder_mode: SaveFolderMode,
+    albums_dir: &Path,
     format: SaveAudioFormat,
     parsed: &ParsedTrack,
     source_station: &str,
     direct_url: Option<&str>,
     mut on_progress: impl FnMut(DownloadStatus),
 ) -> DownloadStatus {
-    let (dest_dir, clean_name, final_path) =
-        resolve_destination(music_dir, folder_mode, format, parsed);
-
-    if final_path.exists() {
-        let status = DownloadStatus::AlreadyExists(final_path);
-        on_progress(status.clone());
-        return status;
-    }
-
-    if let Err(err) = fs::create_dir_all(&dest_dir) {
-        let status = DownloadStatus::Failed(format!("Cannot create {}: {err}", dest_dir.display()));
-        on_progress(status.clone());
-        return status;
+    // Fast duplicate check if we already know artist & title
+    if let Some(ref known_artist) = parsed.artist {
+        let artist_dir = find_canonical_artist_dir(albums_dir, known_artist);
+        if let Some(existing) = artist_has_track(&artist_dir, &parsed.title) {
+            let status = DownloadStatus::AlreadyExists(existing);
+            on_progress(status.clone());
+            return status;
+        }
     }
 
     let is_from_radio = direct_url.is_none();
@@ -762,29 +837,187 @@ pub fn run_save_song(
     };
 
     on_progress(DownloadStatus::Downloading(parsed.display.clone()));
-    let status = match extract_ytdlp_audio(&chosen_url, &dest_dir, &clean_name, format, true) {
-        Ok(actual_path) => {
-            let (info, cover_jpg) = find_and_clean_sidecars(&dest_dir, &clean_name);
+    let staging_root = albums_dir.join(".vibes-staging");
+    let unique = format!(
+        "song-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    let stage_dir = staging_root.join(&unique);
+    if let Err(err) = fs::create_dir_all(&stage_dir) {
+        let status = DownloadStatus::Failed(format!("Cannot create staging dir: {err}"));
+        on_progress(status.clone());
+        return status;
+    }
+
+    let stage_name = sanitize_filename(&parsed.display);
+    let status = match extract_ytdlp_audio_with_retry(&chosen_url, &stage_dir, &stage_name, format, true) {
+        Ok(staged_audio) => {
+            let (info, cover_jpg) = find_and_clean_sidecars(&stage_dir, &stage_name);
             let radio_name = is_from_radio.then_some(source_station);
+
+            let resolved_title = info
+                .as_ref()
+                .and_then(|i| i.track.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| parsed.title.clone());
+
+            let resolved_artist = info
+                .as_ref()
+                .and_then(|i| {
+                    i.artist
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            i.artists.as_ref().and_then(|list| {
+                                let clean: Vec<&str> =
+                                    list.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                                (!clean.is_empty()).then(|| clean.join(", "))
+                            })
+                        })
+                        .or_else(|| {
+                            i.creator
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToOwned::to_owned)
+                        })
+                })
+                .or_else(|| {
+                    parsed
+                        .artist
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+                .or_else(|| {
+                    info.as_ref()
+                        .and_then(|i| i.channel.as_deref().or(i.uploader.as_deref()))
+                        .map(clean_channel_name)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| "Unknown Artist".to_string());
+
+            let artist_dir = find_canonical_artist_dir(albums_dir, &resolved_artist);
+            if let Some(existing) = artist_has_track(&artist_dir, &resolved_title) {
+                let _ = fs::remove_dir_all(&stage_dir);
+                let st = DownloadStatus::AlreadyExists(existing);
+                on_progress(st.clone());
+                return st;
+            }
+
+            let ext = staged_audio
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_else(|| format.extension());
+            let (dest_dir, final_path) = resolve_song_destination_from_meta(
+                albums_dir,
+                &resolved_artist,
+                info.as_ref().and_then(|i| i.album.as_deref()),
+                &resolved_title,
+                radio_name,
+                ext,
+            );
+
+            if final_path.exists() {
+                let _ = fs::remove_dir_all(&stage_dir);
+                let st = DownloadStatus::AlreadyExists(final_path);
+                on_progress(st.clone());
+                return st;
+            }
+
+            // If saving into Singles/, make sure album tag reads "Singles" instead of blank
+            let mut info_for_tags = info.unwrap_or_default();
+            let in_singles = dest_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("singles"));
+            if in_singles {
+                info_for_tags.album = Some("Singles".to_string());
+            }
+
             if let Err(err) = apply_rich_metadata_and_cover(
-                &actual_path,
-                info.as_ref(),
+                &staged_audio,
+                Some(&info_for_tags),
                 cover_jpg.as_deref(),
-                parsed,
+                &ParsedTrack {
+                    artist: Some(resolved_artist),
+                    title: resolved_title,
+                    display: parsed.display.clone(),
+                },
                 radio_name,
                 &chosen_url,
             ) {
-                eprintln!("Vibes metadata warning for {}: {err}", actual_path.display());
+                eprintln!("Vibes metadata warning for {}: {err}", staged_audio.display());
             }
-            DownloadStatus::Saved(actual_path)
+
+            match move_audio_file(&staged_audio, &final_path) {
+                Ok(()) => DownloadStatus::Saved(final_path),
+                Err(err) => DownloadStatus::Failed(format!("Failed moving saved song: {err}")),
+            }
         }
-        Err(err) => {
-            let _ = find_and_clean_sidecars(&dest_dir, &clean_name);
-            DownloadStatus::Failed(format!("{err}"))
-        }
+        Err(err) => DownloadStatus::Failed(format!("{err}")),
     };
+    let _ = fs::remove_dir_all(&stage_dir);
     on_progress(status.clone());
     status
+}
+
+pub fn run_retry_failed_item(
+    item: &FailedDownloadItem,
+    albums_dir: &Path,
+    format: SaveAudioFormat,
+) -> Result<PathBuf> {
+    let url = item
+        .url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+        .with_context(|| format!("No URL recorded for failed item '{}'", item.title))?;
+
+    let is_singles = item
+        .album
+        .as_deref()
+        .is_none_or(|a| a.eq_ignore_ascii_case("singles"));
+    if item.track_number.is_some() && !is_singles {
+        fs::create_dir_all(&item.dest_dir)?;
+        let num = item.track_number.unwrap_or(1);
+        let clean_name = format!("{num:02} - {}", sanitize_filename(&item.title));
+        let path = extract_ytdlp_audio_with_retry(url, &item.dest_dir, &clean_name, format, true)?;
+        let (info, cover_jpg) = find_and_clean_sidecars(&item.dest_dir, &clean_name);
+        let cover_fallback = cover_jpg.or_else(|| fs::read(item.dest_dir.join("cover.jpg")).ok());
+        let parsed = ParsedTrack {
+            artist: Some(item.artist.clone()),
+            title: item.title.clone(),
+            display: format!("{} - {}", item.artist, item.title),
+        };
+        let mut meta = info.unwrap_or_default();
+        if meta.album.is_none() {
+            meta.album = item.album.clone();
+        }
+        let _ = apply_rich_metadata_and_cover(
+            &path,
+            Some(&meta),
+            cover_fallback.as_deref(),
+            &parsed,
+            None,
+            url,
+        );
+        Ok(path)
+    } else {
+        let parsed = ParsedTrack {
+            artist: (!item.artist.trim().is_empty()).then(|| item.artist.clone()),
+            title: item.title.clone(),
+            display: format!("{} - {}", item.artist, item.title),
+        };
+        match run_save_song(albums_dir, format, &parsed, "", Some(url), |_| {}) {
+            DownloadStatus::Saved(p) | DownloadStatus::AlreadyExists(p) => Ok(p),
+            DownloadStatus::Failed(e) => anyhow::bail!("{e}"),
+            _ => anyhow::bail!("Retry did not finish"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -853,6 +1086,39 @@ mod tests {
         let picked = pick_best_youtube_audio_match(&candidates, Some("Gorillaz"), "Feel Good Inc")
             .expect("should pick topic audio");
         assert_eq!(picked.id, "2");
+    }
+
+    #[test]
+    fn route_single_saves_puts_singles_in_artist_singles_and_ignores_station_album() {
+        let tmp = tempfile::tempdir().unwrap();
+        let korn_dir = tmp.path().join("Korn");
+        let existing_alb = korn_dir.join("Follow The Leader");
+        fs::create_dir_all(&existing_alb).unwrap();
+
+        let (dir_alb, path_alb) = resolve_song_destination_from_meta(
+            tmp.path(),
+            "KoRn",
+            Some("Follow The Leader"),
+            "Got the Life",
+            Some("Nuclear Fallout Radio"),
+            "opus",
+        );
+        assert_eq!(dir_alb, existing_alb);
+        assert_eq!(path_alb, existing_alb.join("Got the Life.opus"));
+
+        let (dir_radio, path_radio) = resolve_song_destination_from_meta(
+            tmp.path(),
+            "Jinjer",
+            Some("Nuclear Fallout Radio"),
+            "Someone's Daughter",
+            Some("Nuclear Fallout Radio"),
+            "opus",
+        );
+        assert_eq!(dir_radio, tmp.path().join("Jinjer").join("Singles"));
+        assert_eq!(
+            path_radio,
+            tmp.path().join("Jinjer").join("Singles").join("Someone's Daughter.opus")
+        );
     }
 
     #[test]

@@ -191,12 +191,57 @@ pub fn build_mpv_args(initial_volume: f64, socket_path: &Path) -> Vec<String> {
         "--keep-open=no".to_string(),
         "--ytdl=yes".to_string(),
         "--ytdl-format=bestaudio[ext=webm]/bestaudio/best".to_string(),
+        "--ytdl-raw-options=no-playlist=,extractor-args=youtube:player_client=android_vr".to_string(),
+        "--cache=yes".to_string(),
+        "--cache-pause-initial=no".to_string(),
+        "--cache-pause-wait=0.5".to_string(),
+        "--demuxer-readahead-secs=10".to_string(),
+        "--audio-buffer=0.15".to_string(),
         "--demuxer-max-bytes=16MiB".to_string(),
         "--demuxer-max-back-bytes=8MiB".to_string(),
         "--audio-client-name=Vibes".to_string(),
         format!("--volume={:.0}", initial_volume.clamp(0.0, 100.0)),
         format!("--input-ipc-server={}", socket_path.display()),
     ]
+}
+
+/// Resolves a direct audio stream CDN URL via `yt-dlp -g` (~1.5s with `android_vr`) so `mpv` can start streaming immediately.
+pub fn resolve_youtube_audio_stream_url(url: &str) -> Result<String> {
+    let attempts: [&[&str]; 2] = [
+        &[
+            "-f",
+            "bestaudio[ext=webm]/bestaudio/best",
+            "-g",
+            "--no-playlist",
+            "--no-warnings",
+            "--extractor-args",
+            "youtube:player_client=android_vr",
+            url,
+        ],
+        &[
+            "-f",
+            "bestaudio[ext=webm]/bestaudio/best",
+            "-g",
+            "--no-playlist",
+            "--no-warnings",
+            url,
+        ],
+    ];
+    for args in attempts {
+        if let Ok(out) = Command::new("yt-dlp").args(args).output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(first_http) = text
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("http://") || l.starts_with("https://"))
+            {
+                return Ok(first_http.to_string());
+            }
+        }
+    }
+    anyhow::bail!("Could not resolve direct audio URL for {url}")
 }
 
 impl MpvController {
@@ -426,6 +471,9 @@ mod tests {
         let args = build_mpv_args(72.0, Path::new("/tmp/vibes-test.sock"));
         assert!(args.iter().any(|a| a == "--demuxer-max-bytes=16MiB"));
         assert!(args.iter().any(|a| a == "--demuxer-max-back-bytes=8MiB"));
+        assert!(args.iter().any(|a| a == "--cache-pause-initial=no"));
+        assert!(args.iter().any(|a| a == "--demuxer-readahead-secs=10"));
+        assert!(args.iter().any(|a| a.contains("player_client=android_vr")));
         assert!(args.iter().any(|a| a == "--audio-display=no"));
         assert!(args.iter().any(|a| a == "--ytdl=yes"));
         assert!(args.iter().any(|a| a == "--load-scripts=no"));

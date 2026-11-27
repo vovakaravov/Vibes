@@ -1,5 +1,6 @@
-use super::{VibesWindow, art};
+use super::{VibesWindow, art, library_view};
 use crate::config::PlayTarget;
+use crate::core::RadioTab;
 use crate::radio::GENRE_CHIPS;
 use crate::theme::{hsla, rgb_with_alpha};
 use gpui_kit::assets::IconName;
@@ -28,6 +29,8 @@ pub fn render_radio_view(
         favorites,
         country_code,
         local_blending,
+        radio_tab,
+        log_count,
     ) = {
         let core = win.core.read(cx);
         let active_url = match &core.current_target {
@@ -50,6 +53,8 @@ pub fn render_radio_view(
             core.state.favorites.clone(),
             core.config.country_code.clone(),
             core.config.local_blending,
+            core.radio_tab,
+            core.state.song_log.len(),
         )
     };
 
@@ -59,10 +64,28 @@ pub fn render_radio_view(
     let core_custom = win.core.clone();
     let show_custom = win.show_custom_station;
 
+    if radio_tab != RadioTab::Directory {
+        let fav_count = favorites.len();
+        return v_flex()
+            .size_full()
+            .gap_0()
+            .child(render_radio_tabs_bar(win, radio_tab, fav_count, log_count, &pal, cx))
+            .child(
+                div().flex_1().min_h_0().w_full().child(match radio_tab {
+                    RadioTab::Directory => unreachable!(),
+                    RadioTab::Favorites => library_view::render_favorites_view(win, cx).into_any_element(),
+                    RadioTab::SongLog => library_view::render_song_log_view(win, cx).into_any_element(),
+                }),
+            )
+            .into_any_element();
+    }
+
+    let fav_count = favorites.len();
     v_flex()
         .size_full()
         .p_4()
         .gap_3()
+        .child(render_radio_tabs_bar(win, radio_tab, fav_count, log_count, &pal, cx))
         .child(
             h_flex()
                 .justify_between()
@@ -413,4 +436,42 @@ pub fn render_radio_view(
                         )
                 })),
         )
+        .into_any_element()
+}
+
+fn render_radio_tabs_bar(
+    win: &VibesWindow,
+    active_tab: RadioTab,
+    fav_count: usize,
+    log_count: usize,
+    pal: &crate::theme::Palette,
+    cx: &mut Context<VibesWindow>,
+) -> impl IntoElement {
+    let _ = pal;
+    h_flex()
+        .gap_1p5()
+        .pb_1()
+        .children(RadioTab::ALL.into_iter().map(|t| {
+            let active = t == active_tab;
+            let core_ent = win.core.clone();
+            let label = match t {
+                RadioTab::Directory => "Directory".to_string(),
+                RadioTab::Favorites => format!("Starred Presets ({fav_count})"),
+                RadioTab::SongLog => format!("Heard on Radio ({log_count})"),
+            };
+            Button::new(SharedString::from(format!("rad-tab-{}", t.label())))
+                .with_variant(if active {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Secondary
+                })
+                .xsmall()
+                .label(label)
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    core_ent.update(cx, |c, cx| {
+                        c.radio_tab = t;
+                        cx.notify();
+                    });
+                }))
+        }))
 }

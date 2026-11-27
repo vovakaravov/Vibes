@@ -1,11 +1,16 @@
 use crate::albums::resolve_album_dir;
 use crate::artwork::{resolve_local_album_art, resolve_local_single_art};
 use crate::config::AlbumFolderMode;
+use crate::discography::{
+    canonical_release_key, edition_bloat_rank, find_canonical_artist_dir, is_bloat_track,
+    is_hard_bloat_release, normalize_artist_key,
+};
 use crate::downloader::sanitize_filename;
-use lofty::config::ParseOptions;
+use anyhow::Result;
+use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::{Accessor, ItemKey};
+use lofty::tag::{Accessor, ItemKey, TagExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -63,8 +68,20 @@ impl LocalAlbum {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalArtist {
+    pub name: String,
+    pub key: String,
+    pub folder: PathBuf,
+    pub albums: Vec<LocalAlbum>,
+    pub singles: Vec<LocalTrack>,
+    pub cover_path: Option<PathBuf>,
+    pub total_tracks: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalLibrarySnapshot {
+    pub artists: Vec<LocalArtist>,
     pub albums: Vec<LocalAlbum>,
     pub singles: Vec<LocalTrack>,
 }
@@ -263,6 +280,63 @@ pub fn find_local_album_track(
 ) -> Option<PathBuf> {
     let dir = find_local_album_dir(albums_dir, artist, album_title)?;
     find_local_track_in_dir(&dir, track_number, track_title)
+}
+
+/// Collects normalized track keys across an artist's `Singles/` and album folders.
+pub fn collect_artist_track_keys(artist_dir: &Path) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    let Ok(entries) = fs::read_dir(artist_dir) else {
+        return keys;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() && !is_hidden_name(&p) {
+            if let Ok(sub) = fs::read_dir(&p) {
+                for f in sub.flatten() {
+                    let fp = f.path();
+                    if is_audio_file(&fp) {
+                        let stem = fp.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                        let k = normalize_match_key(strip_track_prefix(stem));
+                        if !k.is_empty() {
+                            keys.insert(k);
+                        }
+                    }
+                }
+            }
+        } else if is_audio_file(&p) {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            let k = normalize_match_key(strip_track_prefix(stem));
+            if !k.is_empty() {
+                keys.insert(k);
+            }
+        }
+    }
+    keys
+}
+
+/// Checks if any folder under `artist_dir` already contains a track matching `track_title`.
+pub fn artist_has_track(artist_dir: &Path, track_title: &str) -> Option<PathBuf> {
+    let want = normalize_match_key(strip_track_prefix(track_title));
+    if want.is_empty() || !artist_dir.is_dir() {
+        return None;
+    }
+    let Ok(entries) = fs::read_dir(artist_dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() && !is_hidden_name(&p) {
+            if let Some(hit) = find_local_track_in_dir(&p, 0, track_title) {
+                return Some(hit);
+            }
+        } else if is_audio_file(&p) {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            if normalize_match_key(strip_track_prefix(stem)) == want {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 pub fn read_local_track(
@@ -524,7 +598,45 @@ fn walk_albums_dir(
             }
         }
     } else if !audio_files.is_empty() {
+        let is_singles_dir = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("singles"));
         let (fallback_artist, fallback_album) = infer_album_fallback(albums_dir, dir);
+
+        if is_singles_dir {
+            for file in audio_files {
+                if !seen_files.insert(canonical_or_raw(&file)) {
+                    continue;
+                }
+                let (mut track, _) = read_local_track(
+                    &file,
+                    fallback_artist.as_deref(),
+                    Some("Singles"),
+                );
+                if track.album.trim().is_empty() {
+                    track.album = "Singles".to_string();
+                }
+                track.cover_path = resolve_local_single_art(&track.path)
+                    .or_else(|| resolve_local_album_art(dir, std::slice::from_ref(&track.path)));
+                singles.push(track);
+            }
+            for sub in subdirs {
+                walk_albums_dir(
+                    albums_dir,
+                    radio_canon,
+                    albums_equal_radio,
+                    &sub,
+                    depth + 1,
+                    seen_dirs,
+                    seen_files,
+                    albums,
+                    singles,
+                );
+            }
+            return;
+        }
+
         let mut tracks = Vec::with_capacity(audio_files.len());
         let mut year: Option<u16> = None;
 
@@ -672,7 +784,626 @@ pub fn scan_local_library(albums_dir: &Path, radio_music_dir: &Path) -> LocalLib
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
 
-    LocalLibrarySnapshot { albums, singles }
+    // Build author-first grouping across albums + singles.
+    struct ArtistAcc {
+        display_names: Vec<String>,
+        albums: Vec<LocalAlbum>,
+        singles: Vec<LocalTrack>,
+    }
+    let mut artist_map: HashMap<String, ArtistAcc> = HashMap::new();
+    for alb in &albums {
+        let k = {
+            let ak = normalize_artist_key(&alb.artist);
+            if ak.is_empty() {
+                "unknown".to_string()
+            } else {
+                ak
+            }
+        };
+        let acc = artist_map.entry(k).or_insert_with(|| ArtistAcc {
+            display_names: Vec::new(),
+            albums: Vec::new(),
+            singles: Vec::new(),
+        });
+        acc.display_names.push(alb.artist.clone());
+        acc.albums.push(alb.clone());
+    }
+    for sng in &singles {
+        let k = {
+            let ak = normalize_artist_key(&sng.artist);
+            if ak.is_empty() {
+                "unknown".to_string()
+            } else {
+                ak
+            }
+        };
+        let acc = artist_map.entry(k).or_insert_with(|| ArtistAcc {
+            display_names: Vec::new(),
+            albums: Vec::new(),
+            singles: Vec::new(),
+        });
+        acc.display_names.push(sng.artist.clone());
+        acc.singles.push(sng.clone());
+    }
+
+    let mut artists: Vec<LocalArtist> = artist_map
+        .into_iter()
+        .map(|(key, mut acc)| {
+            let name = most_common_string(acc.display_names.iter().map(|s| s.as_str()))
+                .unwrap_or_else(|| "Unknown Artist".to_string());
+            acc.albums.sort_by(|a, b| {
+                b.year
+                    .unwrap_or(0)
+                    .cmp(&a.year.unwrap_or(0))
+                    .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            });
+            acc.singles
+                .sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+            let cover_path = acc
+                .albums
+                .iter()
+                .find_map(|a| a.cover_path.clone())
+                .or_else(|| acc.singles.iter().find_map(|s| s.cover_path.clone()));
+            let folder = find_canonical_artist_dir(albums_dir, &name);
+            let total_tracks = acc.albums.iter().map(|a| a.tracks.len()).sum::<usize>()
+                + acc.singles.len();
+            LocalArtist {
+                name,
+                key,
+                folder,
+                albums: acc.albums,
+                singles: acc.singles,
+                cover_path,
+                total_tracks,
+            }
+        })
+        .collect();
+
+    artists.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    LocalLibrarySnapshot {
+        artists,
+        albums,
+        singles,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReorgReport {
+    pub moved_radio: usize,
+    pub consolidated_singles: usize,
+    pub removed_bloat_tracks: usize,
+    pub removed_duplicate_albums: usize,
+    pub removed_duplicate_files: usize,
+    pub renamed_folders: usize,
+    pub backup_dir: PathBuf,
+}
+
+impl ReorgReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "Reorganized: {} Radio routed · {} Singles consolidated · {} bloat tracks, {} dup albums, {} dup files moved to backup ({})",
+            self.moved_radio,
+            self.consolidated_singles,
+            self.removed_bloat_tracks,
+            self.removed_duplicate_albums,
+            self.removed_duplicate_files,
+            self.backup_dir.display()
+        )
+    }
+}
+
+fn format_priority(path: &Path) -> u8 {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("flac") => 5,
+        Some("opus") => 4,
+        Some("m4a") => 3,
+        Some("ogg") => 2,
+        Some("mp3") => 1,
+        _ => 0,
+    }
+}
+
+fn move_file_reorg(src: &Path, dst: &Path) -> Result<()> {
+    if src == dst {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    fs::copy(src, dst)?;
+    let _ = fs::remove_file(src);
+    Ok(())
+}
+
+fn move_to_backup(src: &Path, base_dir: &Path, backup_dir: &Path) -> Result<PathBuf> {
+    let rel = src.strip_prefix(base_dir).unwrap_or_else(|_| {
+        src.file_name()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new("item"))
+    });
+    let mut dst = backup_dir.join(rel);
+    if dst.exists() {
+        let stem = dst
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("item")
+            .to_string();
+        let ext = dst
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        dst = dst.with_file_name(format!(
+            "{stem}-{}{ext}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+    }
+    move_file_reorg(src, &dst)?;
+    Ok(dst)
+}
+
+fn is_fake_radio_album(album: &str, title: &str, radio_station: Option<&str>) -> bool {
+    let trimmed = album.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let ak = normalize_match_key(trimmed);
+    let tk = normalize_match_key(title);
+    if ak.is_empty() || ak == tk {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    lower.contains("radio")
+        || lower.contains(".fm")
+        || trimmed.eq_ignore_ascii_case("radio & singles")
+        || radio_station.is_some_and(|st| st.trim().eq_ignore_ascii_case(trimmed))
+}
+
+fn rewrite_single_album_tag_if_needed(audio_path: &Path, new_album: &str) {
+    if let Ok(p) = Probe::open(audio_path)
+        && let Ok(probe) = p.guess_file_type()
+        && let Ok(mut tf) = probe.read()
+        && let Some(tag) = tf.primary_tag_mut()
+    {
+        tag.set_album(new_album.to_string());
+        let _ = tag.save_to_path(audio_path, WriteOptions::default());
+    }
+}
+
+fn remove_dir_if_only_junk_or_empty(dir: &Path, albums_dir: &Path, backup_dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut any_dir = false;
+    let mut has_audio = false;
+    let mut non_audio = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            any_dir = true;
+        } else if is_audio_file(&p) {
+            has_audio = true;
+        } else {
+            non_audio.push(p);
+        }
+    }
+    if !any_dir && !has_audio {
+        for p in non_audio {
+            let _ = move_to_backup(&p, albums_dir, backup_dir);
+        }
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+/// Safely reorganizes `~/Music` into an author-first layout, backing up removed duplicates/bloat instead of deleting.
+pub fn reorganize_music_library(
+    albums_dir: &Path,
+    radio_dir: &Path,
+    backup_dir: &Path,
+) -> Result<ReorgReport> {
+    let mut report = ReorgReport {
+        backup_dir: backup_dir.to_path_buf(),
+        ..Default::default()
+    };
+
+    // 1. Move files out of `~/Music/Radio/` into proper `<Artist>/<Album>/` or `<Artist>/Singles/`.
+    if radio_dir.is_dir() && canonical_or_raw(radio_dir) != canonical_or_raw(albums_dir) {
+        let entries: Vec<PathBuf> = fs::read_dir(radio_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        for path in entries {
+            if !is_audio_file(&path) {
+                continue;
+            }
+            let tagged = Probe::open(&path)
+                .ok()
+                .and_then(|p| p.guess_file_type().ok())
+                .and_then(|p| {
+                    p.options(ParseOptions::new().read_cover_art(false))
+                        .read()
+                        .ok()
+                });
+            let tag = tagged
+                .as_ref()
+                .and_then(|f| f.primary_tag().or_else(|| f.first_tag()));
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+            let mut title = tag
+                .and_then(|t| t.title().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| stem.to_string());
+            let mut artist = tag
+                .and_then(|t| {
+                    t.artist()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_default();
+            if artist.is_empty()
+                && let Some((a, t)) = stem.split_once(" - ")
+            {
+                artist = a.trim().to_string();
+                if title == stem {
+                    title = t.trim().to_string();
+                }
+            }
+            if artist.is_empty() {
+                artist = "Unknown Artist".to_string();
+            }
+            let raw_album = tag
+                .and_then(|t| t.album().map(|s| s.trim().to_string()))
+                .unwrap_or_default();
+            let station = tag
+                .and_then(|t| t.get_string(ItemKey::InternetRadioStationName))
+                .map(ToOwned::to_owned);
+
+            let artist_dir = find_canonical_artist_dir(albums_dir, &artist);
+            if artist_has_track(&artist_dir, &title).is_some() {
+                move_to_backup(&path, albums_dir, backup_dir)?;
+                report.removed_duplicate_files += 1;
+                continue;
+            }
+
+            let fake_album = is_fake_radio_album(&raw_album, &title, station.as_deref());
+            let dest_dir = if !fake_album {
+                let mut chosen = artist_dir.join(sanitize_filename(&raw_album));
+                if let Ok(subs) = fs::read_dir(&artist_dir) {
+                    let want = normalize_match_key(&raw_album);
+                    for sub in subs.flatten() {
+                        let sp = sub.path();
+                        if sp.is_dir()
+                            && let Some(n) = sp.file_name().and_then(|x| x.to_str())
+                            && normalize_match_key(n) == want
+                        {
+                            chosen = sp;
+                            break;
+                        }
+                    }
+                }
+                chosen
+            } else {
+                artist_dir.join("Singles")
+            };
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("opus");
+            let dst = dest_dir.join(format!("{}.{ext}", sanitize_filename(&title)));
+            move_file_reorg(&path, &dst)?;
+            if fake_album {
+                rewrite_single_album_tag_if_needed(&dst, "Singles");
+            }
+            report.moved_radio += 1;
+        }
+        remove_dir_if_only_junk_or_empty(radio_dir, albums_dir, backup_dir);
+    }
+
+    // 2. Per-artist cleanup: mixed-ext dupes, bloat track removal, duplicate edition dirs, 1-2 track singles consolidation.
+    let top_dirs: Vec<PathBuf> = fs::read_dir(albums_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && !is_hidden_name(p))
+        .collect();
+
+    // Pre-collect collab target folders like "Bad Omens & Poppy" where one artist already has > 1 release.
+    let mut existing_multi_artists: HashSet<String> = HashSet::new();
+    for adir in &top_dirs {
+        let Some(aname) = adir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let sub_count = fs::read_dir(adir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir() && !is_hidden_name(&e.path()))
+            .count();
+        if sub_count >= 2 {
+            existing_multi_artists.insert(normalize_artist_key(aname));
+        }
+    }
+
+    for artist_dir in &top_dirs {
+        let Some(artist_name) = artist_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if artist_name.eq_ignore_ascii_case("radio") {
+            continue;
+        }
+
+        let subdirs: Vec<PathBuf> = fs::read_dir(artist_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && !is_hidden_name(p))
+            .collect();
+
+        // Check if this is a standalone 1-2 track collab directory (e.g. "Bad Omens & Poppy")
+        if subdirs.len() == 1
+            && artist_name.contains('&')
+        {
+            let parts: Vec<&str> = artist_name.split('&').map(str::trim).collect();
+            let target_partner = parts
+                .into_iter()
+                .rev()
+                .find(|p| existing_multi_artists.contains(&normalize_artist_key(p)));
+            if let Some(partner) = target_partner {
+                let solo = &subdirs[0];
+                let files: Vec<PathBuf> = fs::read_dir(solo)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| is_audio_file(p))
+                    .collect();
+                if !files.is_empty() && files.len() <= 2 {
+                    let target_artist_dir = find_canonical_artist_dir(albums_dir, partner);
+                    let target_singles = target_artist_dir.join("Singles");
+                    for f in files {
+                        let (tr, _) = read_local_track(&f, Some(artist_name), Some("Singles"));
+                        if artist_has_track(&target_artist_dir, &tr.title).is_some() {
+                            move_to_backup(&f, albums_dir, backup_dir)?;
+                            report.removed_duplicate_files += 1;
+                        } else {
+                            let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("opus");
+                            let dst =
+                                target_singles.join(format!("{}.{ext}", sanitize_filename(&tr.title)));
+                            move_file_reorg(&f, &dst)?;
+                            rewrite_single_album_tag_if_needed(&dst, "Singles");
+                            report.consolidated_singles += 1;
+                        }
+                    }
+                    remove_dir_if_only_junk_or_empty(solo, albums_dir, backup_dir);
+                    remove_dir_if_only_junk_or_empty(artist_dir, albums_dir, backup_dir);
+                    continue;
+                }
+            }
+        }
+
+        // 2a. Within each album folder: deduplicate mixed extensions (.opus beats .mp3) & strip bloat tracks.
+        let mut album_dirs: Vec<PathBuf> = fs::read_dir(artist_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && !is_hidden_name(p)
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| !n.eq_ignore_ascii_case("singles"))
+            })
+            .collect();
+
+        for alb_dir in &album_dirs {
+            let mut audio_files: Vec<PathBuf> = fs::read_dir(alb_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| is_audio_file(p))
+                .collect();
+            audio_files.sort();
+
+            // Deduplicate identical tracks differing by prefix/extension (e.g. "01 - X.opus" vs "X.mp3")
+            let mut by_key: HashMap<String, Vec<PathBuf>> = HashMap::new();
+            for f in &audio_files {
+                let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                let k = normalize_match_key(strip_track_prefix(stem));
+                by_key.entry(k).or_default().push(f.clone());
+            }
+            let mut removed_set = HashSet::new();
+            for (_k, mut group) in by_key {
+                if group.len() > 1 {
+                    group.sort_by(|a, b| {
+                        format_priority(b)
+                            .cmp(&format_priority(a))
+                            .then_with(|| b.cmp(a))
+                    });
+                    for dupe in group.into_iter().skip(1) {
+                        move_to_backup(&dupe, albums_dir, backup_dir)?;
+                        removed_set.insert(dupe);
+                        report.removed_duplicate_files += 1;
+                    }
+                }
+            }
+            audio_files.retain(|p| !removed_set.contains(p));
+
+            // Strip bloat tracks (Live, Demo, Rough Mix, etc.) if at least 1 non-bloat track remains
+            let mut parsed_tracks: Vec<(PathBuf, Option<u32>, String)> = audio_files
+                .iter()
+                .map(|p| {
+                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                    let num = parse_leading_track_num(stem);
+                    let title = strip_track_prefix(stem).to_string();
+                    (p.clone(), num, title)
+                })
+                .collect();
+            let non_bloat_count = parsed_tracks
+                .iter()
+                .filter(|(_, num, t)| !is_bloat_track(*num, t))
+                .count();
+            if non_bloat_count > 0 && non_bloat_count < parsed_tracks.len() {
+                for (p, num, t) in parsed_tracks.drain(..) {
+                    if is_bloat_track(num, &t) {
+                        move_to_backup(&p, albums_dir, backup_dir)?;
+                        report.removed_bloat_tracks += 1;
+                    }
+                }
+            }
+            if let Ok(entries) = fs::read_dir(alb_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_file()
+                        && p.extension()
+                            .and_then(|x| x.to_str())
+                            .is_some_and(|x| x.eq_ignore_ascii_case("part") || x.eq_ignore_ascii_case("ytdl"))
+                    {
+                        let _ = fs::remove_file(&p);
+                    }
+                }
+            }
+        }
+
+        // Clean rename if a box-set folder now only holds studio tracks (e.g. "And Justice for All (Remastered Deluxe Box Set)")
+        for alb_dir in &mut album_dirs {
+            let fname = alb_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let lower = fname.to_lowercase();
+            if lower.contains("(remastered deluxe box set)")
+                && let Some(clean_name) = fname.split('(').next().map(str::trim).filter(|s| !s.is_empty())
+            {
+                let renamed = artist_dir.join(sanitize_filename(clean_name));
+                if !renamed.exists() && fs::rename(&*alb_dir, &renamed).is_ok() {
+                    *alb_dir = renamed;
+                    report.renamed_folders += 1;
+                }
+            }
+        }
+
+        // 2b. Remove duplicate/hard-bloat edition album folders within the same artist.
+        let mut by_canonical: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for alb_dir in &album_dirs {
+            if !alb_dir.is_dir() {
+                continue;
+            }
+            let fname = alb_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if is_hard_bloat_release(fname) {
+                move_to_backup(alb_dir, albums_dir, backup_dir)?;
+                report.removed_duplicate_albums += 1;
+                continue;
+            }
+            let key = canonical_release_key(fname);
+            if !key.is_empty() {
+                by_canonical.entry(key).or_default().push(alb_dir.clone());
+            }
+        }
+        for (_key, mut group) in by_canonical {
+            if group.len() <= 1 {
+                continue;
+            }
+            group.sort_by_key(|p| {
+                let n = p.file_name().and_then(|x| x.to_str()).unwrap_or_default();
+                (edition_bloat_rank(n), n.len())
+            });
+            let primary = group.remove(0);
+            let primary_keys = collect_artist_track_keys(&primary);
+            for other in group {
+                let other_name = other.file_name().and_then(|x| x.to_str()).unwrap_or_default();
+                let other_keys = collect_artist_track_keys(&other);
+                let overlap = other_keys.iter().filter(|k| primary_keys.contains(*k)).count();
+                let is_box_or_anniversary = edition_bloat_rank(other_name) >= 3;
+                let primary_covered =
+                    !primary_keys.is_empty() && overlap * 10 >= primary_keys.len() * 8;
+                // Remove duplicate deluxe/anniversary folders if either:
+                // - most of `other`'s tracks are already in `primary`, OR
+                // - `other` is a bloated Anniversary/Box-Set edition that duplicates >=80% of `primary`.
+                if other_keys.is_empty()
+                    || overlap * 10 >= other_keys.len() * 6
+                    || (is_box_or_anniversary && primary_covered)
+                {
+                    move_to_backup(&other, albums_dir, backup_dir)?;
+                    report.removed_duplicate_albums += 1;
+                }
+            }
+        }
+
+        // 2c. Consolidate 1-2 track release folders (singles) into `<Artist>/Singles/`, skipping tracks already present in multi-track albums.
+        let remaining_dirs: Vec<PathBuf> = fs::read_dir(artist_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && !is_hidden_name(p)
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| !n.eq_ignore_ascii_case("singles"))
+            })
+            .collect();
+
+        let mut album_track_keys: HashSet<String> = HashSet::new();
+        let mut small_single_dirs = Vec::new();
+        for d in &remaining_dirs {
+            let audio_files: Vec<PathBuf> = fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| is_audio_file(p))
+                .collect();
+            if audio_files.len() >= 3 {
+                for f in audio_files {
+                    let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                    let k = normalize_match_key(strip_track_prefix(stem));
+                    if !k.is_empty() {
+                        album_track_keys.insert(k);
+                    }
+                }
+            } else if !audio_files.is_empty() {
+                small_single_dirs.push((d.clone(), audio_files));
+            }
+        }
+
+        let singles_dir = artist_dir.join("Singles");
+        let mut existing_singles = collect_artist_track_keys(&singles_dir);
+        for (dir, files) in small_single_dirs {
+            for f in files {
+                let (tr, _) = read_local_track(&f, Some(artist_name), Some("Singles"));
+                let k = normalize_match_key(&tr.title);
+                if !k.is_empty() && (album_track_keys.contains(&k) || existing_singles.contains(&k)) {
+                    move_to_backup(&f, albums_dir, backup_dir)?;
+                    report.removed_duplicate_files += 1;
+                } else {
+                    let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("opus");
+                    let dst = singles_dir.join(format!("{}.{ext}", sanitize_filename(&tr.title)));
+                    move_file_reorg(&f, &dst)?;
+                    rewrite_single_album_tag_if_needed(&dst, "Singles");
+                    if !k.is_empty() {
+                        existing_singles.insert(k);
+                    }
+                    report.consolidated_singles += 1;
+                }
+            }
+            remove_dir_if_only_junk_or_empty(&dir, albums_dir, backup_dir);
+        }
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -782,5 +1513,58 @@ mod tests {
 
         let snap = scan_local_library(albums_dir, &radio_dir);
         assert_eq!(snap.albums.len(), 2);
+    }
+
+    #[test]
+    fn scan_groups_artists_and_reorg_cleans_radio_singles_and_bloat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let albums_dir = tmp.path().join("Music");
+        let radio_dir = albums_dir.join("Radio");
+        let backup_dir = tmp.path().join("backup");
+
+        // Metallica with studio album + bloated tracks
+        let ajfa = albums_dir
+            .join("Metallica")
+            .join("And Justice for All (Remastered Deluxe Box Set)");
+        fs::create_dir_all(&ajfa).unwrap();
+        fs::write(ajfa.join("01 - Blackened.opus"), b"a").unwrap();
+        fs::write(ajfa.join("02 - And Justice for All.opus"), b"a2").unwrap();
+        fs::write(ajfa.join("04 - One.opus"), b"a4").unwrap();
+        fs::write(ajfa.join("10 - The Ecstasy of Gold.opus"), b"b").unwrap();
+        fs::write(ajfa.join("11 - Blackened (Live - Seattle '89).opus"), b"c").unwrap();
+
+        // Poppy with multi-track album + redundant 1-track single album
+        let neg = albums_dir.join("Poppy").join("Negative Spaces");
+        fs::create_dir_all(&neg).unwrap();
+        fs::write(neg.join("01 - have you had enough.opus"), b"a").unwrap();
+        fs::write(neg.join("02 - new way out.opus"), b"b").unwrap();
+        fs::write(neg.join("03 - halo.opus"), b"c").unwrap();
+        let dup_single = albums_dir.join("Poppy").join("new way out");
+        fs::create_dir_all(&dup_single).unwrap();
+        fs::write(dup_single.join("01 - new way out.opus"), b"d").unwrap();
+        let unique_single = albums_dir.join("Poppy").join("Her");
+        fs::create_dir_all(&unique_single).unwrap();
+        fs::write(unique_single.join("01 - Her.opus"), b"e").unwrap();
+
+        // Radio loose track
+        fs::create_dir_all(&radio_dir).unwrap();
+        fs::write(radio_dir.join("Jinjer - Someone's Daughter.opus"), b"r").unwrap();
+
+        let report = reorganize_music_library(&albums_dir, &radio_dir, &backup_dir).unwrap();
+        assert_eq!(report.moved_radio, 1);
+        assert_eq!(report.removed_bloat_tracks, 2);
+        assert!(report.removed_duplicate_files >= 1);
+        assert!(report.consolidated_singles >= 1);
+
+        assert!(albums_dir.join("Metallica").join("And Justice for All").join("01 - Blackened.opus").is_file());
+        assert!(albums_dir.join("Poppy").join("Singles").join("Her.opus").is_file());
+        assert!(albums_dir.join("Jinjer").join("Singles").join("Someone's Daughter.opus").is_file());
+        assert!(!dup_single.exists());
+        assert!(!unique_single.exists());
+
+        let snap = scan_local_library(&albums_dir, &radio_dir);
+        assert!(snap.artists.iter().any(|a| a.name == "Metallica" && a.albums.len() == 1));
+        assert!(snap.artists.iter().any(|a| a.name == "Poppy" && a.albums.len() == 1 && a.singles.len() == 1));
+        assert!(snap.artists.iter().any(|a| a.name == "Jinjer" && a.singles.len() == 1));
     }
 }

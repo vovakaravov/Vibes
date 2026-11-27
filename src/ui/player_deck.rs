@@ -7,8 +7,8 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     Bounds, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, ScrollDelta, ScrollEvent, Styled, canvas, div, fill, point,
-    prelude::FluentBuilder as _, px, size,
+    ParentElement, ScrollDelta, ScrollEvent, StatefulInteractiveElement as _, Styled, canvas, div,
+    fill, point, prelude::FluentBuilder as _, px, size,
 };
 
 fn paint_slider_track(
@@ -130,6 +130,19 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
     let saving = core.active_saving_count() > 0;
     let vis_enabled = core.config.visualizer_enabled;
     let lyrics_open = core.lyrics_open;
+    let shuffle_enabled = core.state.shuffle_enabled;
+    let repeat_mode = core.state.repeat_mode;
+    let current_local_path = match &core.current_target {
+        Some(PlayTarget::Local(t)) => Some(t.path.clone()),
+        _ => None,
+    };
+    let is_liked_local = current_local_path
+        .as_ref()
+        .is_some_and(|p| core.is_track_liked(p));
+    let jump_artist_name = match &core.current_target {
+        Some(PlayTarget::Local(t)) => Some(t.artist.clone()),
+        _ => None,
+    };
 
     let (primary_title, sub_title, fav_station, is_fav) = match &core.current_target {
         Some(PlayTarget::Radio(s)) => {
@@ -219,6 +232,10 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
     let core_mute = win.core.clone();
     let core_vol_scroll = win.core.clone();
     let core_cmp = win.core.clone();
+    let core_shuf = win.core.clone();
+    let core_rep = win.core.clone();
+    let core_like_local = win.core.clone();
+    let core_jump_art = win.core.clone();
 
     let seek_geo = win.seek_geo.clone();
     let vol_geo = win.vol_geo.clone();
@@ -341,6 +358,17 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                         .items_center()
                                         .child(
                                             div()
+                                                .id("deck-subtitle-jump")
+                                                .when(jump_artist_name.is_some(), |d| {
+                                                    let j_name = jump_artist_name.clone().unwrap_or_default();
+                                                    d.cursor_pointer()
+                                                        .hover(|s| s.text_color(hsla(pal.accent)))
+                                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                                            core_jump_art.update(cx, |c, cx| {
+                                                                c.jump_to_artist_by_name(&j_name, cx);
+                                                            });
+                                                        }))
+                                                })
                                                 .text_xs()
                                                 .text_color(hsla(pal.fg_muted))
                                                 .truncate()
@@ -373,6 +401,19 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                         .flex_shrink_0()
                         .when(!compact, |r| {
                             r.child(
+                                Button::new("deck-shuffle")
+                                    .with_variant(if shuffle_enabled {
+                                        ButtonVariant::Primary
+                                    } else {
+                                        ButtonVariant::Ghost
+                                    })
+                                    .xsmall()
+                                    .icon(IconName::Shuffle)
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        core_shuf.update(cx, |c, cx| c.toggle_shuffle(cx));
+                                    })),
+                            )
+                            .child(
                                 Button::new("deck-prev")
                                     .ghost()
                                     .small()
@@ -430,6 +471,22 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                     })),
                             )
                             .child(
+                                Button::new("deck-repeat")
+                                    .with_variant(if repeat_mode != crate::config::RepeatMode::Off {
+                                        ButtonVariant::Primary
+                                    } else {
+                                        ButtonVariant::Ghost
+                                    })
+                                    .xsmall()
+                                    .icon(IconName::RefreshCw)
+                                    .when(repeat_mode != crate::config::RepeatMode::Off, |b| {
+                                        b.label(repeat_mode.label())
+                                    })
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        core_rep.update(cx, |c, cx| c.cycle_repeat_mode(cx));
+                                    })),
+                            )
+                            .child(
                                 Button::new("deck-stop")
                                     .ghost()
                                     .small()
@@ -471,6 +528,26 @@ pub fn render_player_deck(win: &mut VibesWindow, cx: &mut Context<VibesWindow>) 
                                     })
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         core_save.update(cx, |c, cx| c.save_current_song(cx));
+                                    })),
+                            )
+                        })
+                        .when_some(current_local_path, |r, p| {
+                            r.child(
+                                Button::new("deck-like-local")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Star).xsmall().text_color(hsla(
+                                        if is_liked_local {
+                                            pal.yellow
+                                        } else {
+                                            pal.fg_muted
+                                        },
+                                    )))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        let path = p.clone();
+                                        core_like_local.update(cx, |c, cx| {
+                                            c.toggle_like_track(path, cx)
+                                        });
                                     })),
                             )
                         })
