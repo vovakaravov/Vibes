@@ -90,6 +90,15 @@ pub fn is_audio_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
+    let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if fname.contains(".temp.") {
+        return false;
+    }
+    if fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true) {
+        return false;
+    }
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| AUDIO_EXTS.iter().any(|&k| k.eq_ignore_ascii_case(ext)))
@@ -1566,5 +1575,20 @@ mod tests {
         assert!(snap.artists.iter().any(|a| a.name == "Metallica" && a.albums.len() == 1));
         assert!(snap.artists.iter().any(|a| a.name == "Poppy" && a.albums.len() == 1 && a.singles.len() == 1));
         assert!(snap.artists.iter().any(|a| a.name == "Jinjer" && a.singles.len() == 1));
+    }
+
+    #[test]
+    fn is_audio_file_ignores_temp_and_empty_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("03 - FUCK.opus");
+        let temp = tmp.path().join("03 - FUCK.temp.opus");
+        let empty = tmp.path().join("04 - Empty.opus");
+        fs::write(&real, b"OggS").unwrap();
+        fs::write(&temp, b"OggS").unwrap();
+        fs::write(&empty, b"").unwrap();
+
+        assert!(is_audio_file(&real));
+        assert!(!is_audio_file(&temp));
+        assert!(!is_audio_file(&empty));
     }
 }
